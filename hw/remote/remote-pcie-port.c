@@ -33,6 +33,8 @@
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
+#include "hw/pci/msix.h"
+#include "hw/pci/pcie.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "system/dma.h"
@@ -242,73 +244,29 @@ static const MemoryRegionOps rpcie_bar_ops = {
 
 static uint32_t rpcie_config_read(PCIDevice *d, uint32_t address, int len)
 {
-    RemotePciePort *rp = REMOTE_PCIE_PORT(d);
-
-    if (rp->conn_fd < 0 || !rp->rx_running) {
-        return pci_default_read_config(d, address, len);
-    }
-
-    rpcie_tlp_cfg_t tlp;
-    memset(&tlp, 0, sizeof(tlp));
-    tlp.hdr.fmt_type     = RPCIE_TLP_CFGRD0;
-    tlp.hdr.length_dw    = 1;
-    tlp.hdr.requester_id = 0;
-    tlp.hdr.byte_enables = rpcie_compute_first_be(address, len);
-    tlp.completer_id     = rp->remote_bdf;
-    tlp.reg_addr         = address & 0xFFFC;
-
-    uint32_t seq = rpcie_alloc_seq(rp);
-    uint32_t data = 0xFFFFFFFF;
-    uint8_t  status = RPCIE_CPL_UR;
-
-    if (rpcie_send_and_wait(rp, seq, &tlp, sizeof(tlp),
-                            &data, &status, 5000) < 0 ||
-        status != RPCIE_CPL_SC) {
-        return 0xFFFFFFFF;
-    }
-
-    int shift = (address & 3) * 8;
-    uint32_t result = data >> shift;
-    if (len < 4) {
-        result &= (1u << (len * 8)) - 1;
-    }
-    return result;
+    /*
+     * Config space is handled locally inside QEMU's PCI config buffer,
+     * which was populated from the initial FN_ADD handshake data.
+     * The simulation's RTL endpoint (PCIeEndpointIO) only exposes
+     * BAR, DMA, and interrupt interfaces — there is no config-space
+     * TLP path through CosimHarness.
+     *
+     * MSI-X table reads/writes go through BAR MMIO (the MSI-X table
+     * lives in a BAR region), so they still reach the simulation.
+     */
+    return pci_default_read_config(d, address, len);
 }
 
 static void rpcie_config_write(PCIDevice *d, uint32_t address,
                                uint32_t val, int len)
 {
-    RemotePciePort *rp = REMOTE_PCIE_PORT(d);
-
     /*
-     * Apply locally so QEMU updates BAR mappings when the guest
-     * programs BAR addresses.  This is the ONLY reason we touch
-     * local config — everything else is owned by the simulation.
+     * Apply locally so QEMU updates BAR mappings, command register,
+     * and capability structures when the guest programs them.
+     * As with reads, config-space writes are not forwarded to the
+     * simulation because it has no config-space TLP path.
      */
     pci_default_write_config(d, address, val, len);
-
-    if (rp->conn_fd < 0 || !rp->rx_running) {
-        return;
-    }
-
-    /* Forward to simulation */
-    uint8_t buf[sizeof(rpcie_tlp_cfg_t) + 4];
-    rpcie_tlp_cfg_t *tlp = (rpcie_tlp_cfg_t *)buf;
-
-    memset(buf, 0, sizeof(buf));
-    tlp->hdr.fmt_type     = RPCIE_TLP_CFGWR0;
-    tlp->hdr.length_dw    = 1;
-    tlp->hdr.requester_id = 0;
-    tlp->hdr.byte_enables = rpcie_compute_first_be(address, len);
-    tlp->completer_id     = rp->remote_bdf;
-    tlp->reg_addr         = address & 0xFFFC;
-
-    uint32_t dw = val << ((address & 3) * 8);
-    memcpy(buf + sizeof(rpcie_tlp_cfg_t), &dw, 4);
-
-    uint32_t seq = rpcie_alloc_seq(rp);
-    rpcie_send_and_wait(rp, seq, buf, sizeof(rpcie_tlp_cfg_t) + 4,
-                        NULL, NULL, 5000);
 }
 
 /* ================================================================== */
@@ -474,19 +432,13 @@ static void *rpcie_rx_thread(void *opaque)
 
 static int rpcie_handshake(RemotePciePort *rp)
 {
-    rpcie_ctrl_handshake_t hs = {
-        .msg_type     = RPCIE_CTRL_HANDSHAKE,
-        .version      = RPCIE_PROTOCOL_VERSION,
-        .capabilities = RPCIE_CAP_SRIOV | RPCIE_CAP_AER |
-                        RPCIE_CAP_SHM | RPCIE_CAP_FLR |
-                        RPCIE_CAP_HOTPLUG,
-    };
+    /*
+     * The simulation (C bridge) is the server and initiates the handshake
+     * by sending RPCIE_CTRL_HANDSHAKE.  We (QEMU, the client) receive it
+     * and reply with RPCIE_CTRL_HANDSHAKE_ACK.
+     */
 
-    if (rpcie_send_msg(rp, rpcie_alloc_seq(rp), &hs, sizeof(hs)) < 0) {
-        error_report("rpcie: handshake send failed");
-        return -1;
-    }
-
+    /* ---- Step 1: receive server's HANDSHAKE ---- */
     rpcie_frame_hdr_t hdr;
     if (rpcie_recv_full(rp->conn_fd, &hdr, sizeof(hdr)) < 0 ||
         hdr.magic != RPCIE_MAGIC) {
@@ -494,17 +446,17 @@ static int rpcie_handshake(RemotePciePort *rp)
         return -1;
     }
 
-    rpcie_ctrl_handshake_t ack;
-    if (hdr.length < sizeof(ack) ||
-        rpcie_recv_full(rp->conn_fd, &ack, sizeof(ack)) < 0) {
-        error_report("rpcie: handshake ack truncated");
+    rpcie_ctrl_handshake_t incoming;
+    if (hdr.length < sizeof(incoming) ||
+        rpcie_recv_full(rp->conn_fd, &incoming, sizeof(incoming)) < 0) {
+        error_report("rpcie: handshake truncated");
         return -1;
     }
 
-    /* Drain extra bytes (forward compat) */
-    if (hdr.length > sizeof(ack)) {
+    /* Drain extra payload bytes (forward compat) */
+    if (hdr.length > sizeof(incoming)) {
         uint8_t drain[256];
-        uint32_t extra = hdr.length - sizeof(ack);
+        uint32_t extra = hdr.length - sizeof(incoming);
         while (extra > 0) {
             uint32_t n = extra > sizeof(drain) ? sizeof(drain) : extra;
             rpcie_recv_full(rp->conn_fd, drain, n);
@@ -512,14 +464,28 @@ static int rpcie_handshake(RemotePciePort *rp)
         }
     }
 
-    if (ack.msg_type != RPCIE_CTRL_HANDSHAKE_ACK ||
-        ack.version != RPCIE_PROTOCOL_VERSION) {
-        error_report("rpcie: handshake mismatch (type=0x%x ver=%d)",
-                     ack.msg_type, ack.version);
+    if (incoming.msg_type != RPCIE_CTRL_HANDSHAKE ||
+        incoming.version != RPCIE_PROTOCOL_VERSION) {
+        error_report("rpcie: handshake unexpected (type=0x%x ver=%d)",
+                     incoming.msg_type, incoming.version);
         return -1;
     }
 
-    rp->remote_caps = hs.capabilities & ack.capabilities;
+    /* ---- Step 2: send HANDSHAKE_ACK ---- */
+    rpcie_ctrl_handshake_t ack = {
+        .msg_type     = RPCIE_CTRL_HANDSHAKE_ACK,
+        .version      = RPCIE_PROTOCOL_VERSION,
+        .capabilities = RPCIE_CAP_SRIOV | RPCIE_CAP_AER |
+                        RPCIE_CAP_SHM | RPCIE_CAP_FLR |
+                        RPCIE_CAP_HOTPLUG,
+    };
+
+    if (rpcie_send_msg(rp, rpcie_alloc_seq(rp), &ack, sizeof(ack)) < 0) {
+        error_report("rpcie: handshake ack send failed");
+        return -1;
+    }
+
+    rp->remote_caps = incoming.capabilities & ack.capabilities;
     info_report("rpcie: handshake OK, caps 0x%08x", rp->remote_caps);
     return 0;
 }
@@ -619,6 +585,68 @@ static int rpcie_recv_initial_fn_add(RemotePciePort *rp, Error **errp)
         pci_register_bar(d, i, pci_type, &rp->bar_mr[i]);
 
         if (bar.type == RPCIE_BAR_MEM64) i++;  /* skip next index */
+    }
+
+    /* ---- Parse MSI-X info ---- */
+    if (fn.has_msix && remaining >= sizeof(rpcie_msix_info_t)) {
+        rpcie_msix_info_t msix;
+        memcpy(&msix, p, sizeof(msix));
+        p += sizeof(msix);
+        remaining -= sizeof(msix);
+
+        /*
+         * Add MSI-X capability to config space manually (without
+         * msix_init) so the guest can discover it.  We do NOT use
+         * QEMU's msix_init because that intercepts BAR MMIO for the
+         * MSI-X table region — we want those accesses forwarded to
+         * the simulation's RTL, which owns the actual MSI-X table.
+         *
+         * Interrupt injection uses msi_send_message(addr, data) with
+         * raw addr+data from the simulation, bypassing QEMU's MSI-X
+         * table entirely.
+         */
+        int cap_pos = pci_add_capability(d, PCI_CAP_ID_MSIX, 0,
+                                         MSIX_CAP_LENGTH, errp);
+        if (cap_pos >= 0) {
+            /* Message Control: table size - 1 in bits [10:0] */
+            pci_set_word(d->config + cap_pos + PCI_MSIX_FLAGS,
+                         (msix.table_size - 1) & PCI_MSIX_FLAGS_QSIZE);
+            /* Make enable (bit 15) and function mask (bit 14) writable */
+            pci_set_word(d->wmask + cap_pos + PCI_MSIX_FLAGS,
+                         PCI_MSIX_FLAGS_ENABLE | PCI_MSIX_FLAGS_MASKALL);
+
+            /* Table BIR + offset */
+            pci_set_long(d->config + cap_pos + PCI_MSIX_TABLE,
+                         (msix.table_offset & ~0x7u) |
+                         (msix.table_bar & 0x7));
+            /* PBA BIR + offset */
+            pci_set_long(d->config + cap_pos + PCI_MSIX_PBA,
+                         (msix.pba_offset & ~0x7u) |
+                         (msix.pba_bar & 0x7));
+        }
+    }
+
+    /* ---- Parse MSI info ---- */
+    if (fn.has_msi && remaining >= sizeof(rpcie_msi_info_t)) {
+        rpcie_msi_info_t msi_info;
+        memcpy(&msi_info, p, sizeof(msi_info));
+        p += sizeof(msi_info);
+        remaining -= sizeof(msi_info);
+
+        /*
+         * Set up MSI capability.  As with MSI-X, interrupt delivery
+         * uses msi_send_message and does not depend on QEMU's MSI
+         * infrastructure.  We add the capability so the guest can
+         * discover and enable MSI if desired.
+         */
+        int msi_flags = PCI_MSI_FLAGS_64BIT * msi_info.is_64bit;
+        if (msi_init(d, 0, msi_info.num_vectors,
+                     msi_info.is_64bit, msi_info.per_vector_mask,
+                     errp) < 0) {
+            info_report("rpcie: msi_init failed (non-fatal), MSI won't be available");
+            /* Non-fatal — device works without MSI */
+            (void)msi_flags;
+        }
     }
 
     info_report("rpcie: device %04x:%04x, %d BARs",
