@@ -35,6 +35,7 @@
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
 #include "hw/pci/pcie.h"
+#include "hw/pci/pcie_sriov.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "system/dma.h"
@@ -183,7 +184,8 @@ static uint64_t rpcie_bar_read(void *opaque, hwaddr addr, unsigned size)
     tlp.hdr.requester_id = 0;
     tlp.hdr.tag          = ctx->bar_idx;  /* BAR index in tag */
     tlp.hdr.byte_enables = rpcie_compute_first_be((uint32_t)addr, size);
-    tlp.address          = addr;          /* BAR-relative offset */
+    /* Convention: address = (bar_idx << 28) | bar_offset */
+    tlp.address          = ((uint64_t)ctx->bar_idx << 28) | (addr & 0x0FFFFFFF);
 
     uint32_t seq = rpcie_alloc_seq(rp);
     uint32_t data = 0xFFFFFFFF;
@@ -219,7 +221,8 @@ static void rpcie_bar_write(void *opaque, hwaddr addr,
     tlp->hdr.requester_id = 0;
     tlp->hdr.tag          = ctx->bar_idx;
     tlp->hdr.byte_enables = rpcie_compute_first_be((uint32_t)addr, size);
-    tlp->address          = addr;
+    /* Convention: address = (bar_idx << 28) | bar_offset */
+    tlp->address          = ((uint64_t)ctx->bar_idx << 28) | (addr & 0x0FFFFFFF);
 
     uint32_t wdata = (uint32_t)(data << (((int)addr & 3) * 8));
     memcpy(buf + sizeof(rpcie_tlp_mem_t), &wdata, 4);
@@ -231,6 +234,92 @@ static void rpcie_bar_write(void *opaque, hwaddr addr,
 static const MemoryRegionOps rpcie_bar_ops = {
     .read  = rpcie_bar_read,
     .write = rpcie_bar_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+/* ================================================================== */
+/*  VF BAR MMIO — forward reads/writes through PF's socket            */
+/* ================================================================== */
+
+typedef struct RpcieVfBarContext {
+    RemotePciePortVF *vf;
+    int               bar_idx;
+} RpcieVfBarContext;
+
+static uint64_t rpcie_vf_bar_read(void *opaque, hwaddr addr, unsigned size)
+{
+    RpcieVfBarContext *ctx = opaque;
+    PCIDevice *vf_dev = PCI_DEVICE(ctx->vf);
+    PCIDevice *pf_dev = pcie_sriov_get_pf(vf_dev);
+    RemotePciePort *rp = REMOTE_PCIE_PORT(pf_dev);
+    uint16_t vf_num = pcie_sriov_vf_number(vf_dev);
+
+    rpcie_tlp_mem_t tlp;
+    memset(&tlp, 0, sizeof(tlp));
+    tlp.hdr.fmt_type     = RPCIE_TLP_MRD32;
+    tlp.hdr.length_dw    = (size + 3) / 4;
+    /* Encode VF BDF as requester_id so the bridge routes to the VF */
+    tlp.hdr.requester_id = RPCIE_BDF(0, 0,
+        RPCIE_BDF_FN(rp->remote_bdf) + rp->sriov_vf_offset + vf_num * rp->sriov_vf_stride);
+    tlp.hdr.tag          = ctx->bar_idx;
+    tlp.hdr.byte_enables = rpcie_compute_first_be((uint32_t)addr, size);
+    /* Convention: address = (bar_idx << 28) | bar_offset */
+    tlp.address          = ((uint64_t)ctx->bar_idx << 28) | (addr & 0x0FFFFFFF);
+
+    uint32_t seq = rpcie_alloc_seq(rp);
+    uint32_t data = 0xFFFFFFFF;
+    uint8_t  status = RPCIE_CPL_UR;
+
+    if (rpcie_send_and_wait(rp, seq, &tlp, sizeof(tlp),
+                            &data, &status, 5000) < 0 ||
+        status != RPCIE_CPL_SC) {
+        return 0xFFFFFFFF;
+    }
+
+    int shift = ((int)addr & 3) * 8;
+    uint64_t result = (uint64_t)data >> shift;
+    if (size < 4) {
+        result &= (1ULL << (size * 8)) - 1;
+    }
+    return result;
+}
+
+static void rpcie_vf_bar_write(void *opaque, hwaddr addr,
+                               uint64_t data, unsigned size)
+{
+    RpcieVfBarContext *ctx = opaque;
+    PCIDevice *vf_dev = PCI_DEVICE(ctx->vf);
+    PCIDevice *pf_dev = pcie_sriov_get_pf(vf_dev);
+    RemotePciePort *rp = REMOTE_PCIE_PORT(pf_dev);
+    uint16_t vf_num = pcie_sriov_vf_number(vf_dev);
+
+    uint8_t buf[sizeof(rpcie_tlp_mem_t) + 4];
+    rpcie_tlp_mem_t *tlp = (rpcie_tlp_mem_t *)buf;
+
+    memset(buf, 0, sizeof(buf));
+    tlp->hdr.fmt_type     = RPCIE_TLP_MWR32;
+    tlp->hdr.length_dw    = 1;
+    tlp->hdr.requester_id = RPCIE_BDF(0, 0,
+        RPCIE_BDF_FN(rp->remote_bdf) + rp->sriov_vf_offset + vf_num * rp->sriov_vf_stride);
+    tlp->hdr.tag          = ctx->bar_idx;
+    tlp->hdr.byte_enables = rpcie_compute_first_be((uint32_t)addr, size);
+    /* Convention: address = (bar_idx << 28) | bar_offset */
+    tlp->address          = ((uint64_t)ctx->bar_idx << 28) | (addr & 0x0FFFFFFF);
+
+    uint32_t wdata = (uint32_t)(data << (((int)addr & 3) * 8));
+    memcpy(buf + sizeof(rpcie_tlp_mem_t), &wdata, 4);
+
+    uint32_t seq = rpcie_alloc_seq(rp);
+    rpcie_send_msg(rp, seq, buf, sizeof(rpcie_tlp_mem_t) + 4);
+}
+
+static const MemoryRegionOps rpcie_vf_bar_ops = {
+    .read  = rpcie_vf_bar_read,
+    .write = rpcie_vf_bar_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .impl = {
         .min_access_size = 1,
@@ -260,6 +349,8 @@ static uint32_t rpcie_config_read(PCIDevice *d, uint32_t address, int len)
 static void rpcie_config_write(PCIDevice *d, uint32_t address,
                                uint32_t val, int len)
 {
+    RemotePciePort *rp = REMOTE_PCIE_PORT(d);
+
     /*
      * Apply locally so QEMU updates BAR mappings, command register,
      * and capability structures when the guest programs them.
@@ -267,6 +358,31 @@ static void rpcie_config_write(PCIDevice *d, uint32_t address,
      * simulation because it has no config-space TLP path.
      */
     pci_default_write_config(d, address, val, len);
+
+    /*
+     * If SR-IOV capable, let QEMU's SR-IOV subsystem handle VF
+     * creation/destruction when guest writes VF Enable.
+     */
+    if (rp->sriov_capable) {
+        uint16_t old_num_vfs = pcie_sriov_num_vfs(d);
+        pcie_sriov_config_write(d, address, val, len);
+        uint16_t new_num_vfs = pcie_sriov_num_vfs(d);
+
+        /* Detect VF enable state change → notify simulation */
+        if (old_num_vfs != new_num_vfs) {
+            rpcie_ctrl_sriov_event_t ev = {
+                .msg_type  = RPCIE_CTRL_SRIOV_EVENT,
+                .pf_index  = 0,
+                .vf_enable = (new_num_vfs > 0) ? 1 : 0,
+                .reserved  = 0,
+                .num_vfs   = new_num_vfs,
+                .reserved2 = 0,
+            };
+            rpcie_send_msg(rp, rpcie_alloc_seq(rp), &ev, sizeof(ev));
+            info_report("rpcie: SR-IOV event → vf_enable=%d num_vfs=%d",
+                        ev.vf_enable, new_num_vfs);
+        }
+    }
 }
 
 /* ================================================================== */
@@ -587,6 +703,12 @@ static int rpcie_recv_initial_fn_add(RemotePciePort *rp, Error **errp)
         if (bar.type == RPCIE_BAR_MEM64) i++;  /* skip next index */
     }
 
+    /* ---- PCIe Endpoint Capability (required for extended capabilities) ---- */
+    if (pcie_endpoint_cap_init(d, 0) < 0) {
+        error_setg(errp, "rpcie: failed to init PCIe endpoint cap");
+        return -1;
+    }
+
     /* ---- Parse MSI-X info ---- */
     if (fn.has_msix && remaining >= sizeof(rpcie_msix_info_t)) {
         rpcie_msix_info_t msix;
@@ -646,6 +768,64 @@ static int rpcie_recv_initial_fn_add(RemotePciePort *rp, Error **errp)
             info_report("rpcie: msi_init failed (non-fatal), MSI won't be available");
             /* Non-fatal — device works without MSI */
             (void)msi_flags;
+        }
+    }
+
+    /* ---- Parse SR-IOV info ---- */
+    if (fn.has_sriov && remaining >= sizeof(rpcie_sriov_info_t)) {
+        rpcie_sriov_info_t sriov;
+        memcpy(&sriov, p, sizeof(sriov));
+        p += sizeof(sriov);
+        remaining -= sizeof(sriov);
+
+        rp->sriov_capable      = true;
+        rp->sriov_total_vfs    = sriov.total_vfs;
+        rp->sriov_vf_device_id = sriov.vf_device_id;
+        rp->sriov_vf_offset    = sriov.vf_offset;
+        rp->sriov_vf_stride    = sriov.vf_stride;
+        rp->sriov_num_vf_bars  = sriov.num_vf_bars;
+
+        /* Parse VF BAR descriptors */
+        for (int i = 0; i < sriov.num_vf_bars && i < RPCIE_MAX_BARS
+             && remaining >= sizeof(rpcie_bar_desc_t); i++) {
+            rpcie_bar_desc_t vf_bar;
+            memcpy(&vf_bar, p, sizeof(vf_bar));
+            p += sizeof(vf_bar);
+            remaining -= sizeof(vf_bar);
+            rp->sriov_vf_bar_size[i] = vf_bar.size;
+            rp->sriov_vf_bar_type[i] = vf_bar.type;
+        }
+
+        /* Initialize SR-IOV Extended Capability via QEMU's API */
+        if (!pcie_sriov_pf_init(d, 0x200,
+                                TYPE_REMOTE_PCIE_PORT_VF,
+                                sriov.vf_device_id,
+                                sriov.total_vfs,   /* init_vfs */
+                                sriov.total_vfs,   /* total_vfs */
+                                sriov.vf_offset,
+                                sriov.vf_stride,
+                                errp)) {
+            info_report("rpcie: pcie_sriov_pf_init failed (non-fatal)");
+            rp->sriov_capable = false;
+        } else {
+            /* Register VF BARs with the SR-IOV subsystem */
+            for (int i = 0; i < sriov.num_vf_bars && i < RPCIE_MAX_BARS; i++) {
+                if (rp->sriov_vf_bar_size[i] == 0) continue;
+
+                int pci_type = PCI_BASE_ADDRESS_SPACE_MEMORY;
+                if (rp->sriov_vf_bar_type[i] == RPCIE_BAR_MEM64) {
+                    pci_type |= PCI_BASE_ADDRESS_MEM_TYPE_64;
+                }
+                pcie_sriov_pf_init_vf_bar(d, i, pci_type,
+                                          rp->sriov_vf_bar_size[i]);
+            }
+
+            if (sriov.supported_page_sizes) {
+                pcie_sriov_pf_add_sup_pgsize(d, sriov.supported_page_sizes);
+            }
+
+            info_report("rpcie: SR-IOV enabled, total_vfs=%d vf_dev=0x%04x",
+                        sriov.total_vfs, sriov.vf_device_id);
         }
     }
 
@@ -785,6 +965,12 @@ static void rpcie_exit(PCIDevice *d)
     }
     qemu_thread_join(&rp->rx_thread);
 
+    if (rp->sriov_capable) {
+        pcie_sriov_pf_exit(d);
+    }
+
+    pcie_cap_exit(d);
+
     for (int i = 0; i < rp->num_bars; i++) {
         if (rp->bar_mr[i].size) {
             g_free(rp->bar_mr[i].opaque);
@@ -815,6 +1001,11 @@ static void rpcie_reset_hold(Object *obj, ResetType type)
     }
 
     RemotePciePort *rp = REMOTE_PCIE_PORT(obj);
+
+    if (rp->sriov_capable) {
+        pcie_sriov_pf_reset(PCI_DEVICE(rp));
+    }
+
     if (rp->conn_fd >= 0 && rp->rx_running) {
         rpcie_ctrl_reset_t msg = {
             .msg_type   = RPCIE_CTRL_RESET,
@@ -877,9 +1068,86 @@ static const TypeInfo rpcie_info = {
     },
 };
 
+/* ================================================================== */
+/*  VF companion device                                               */
+/* ================================================================== */
+
+static void rpcie_vf_realize(PCIDevice *d, Error **errp)
+{
+    RemotePciePortVF *vf = REMOTE_PCIE_PORT_VF(d);
+    PCIDevice *pf_dev = pcie_sriov_get_pf(d);
+    RemotePciePort *rp = REMOTE_PCIE_PORT(pf_dev);
+
+    /* Register VF BARs that forward MMIO through the PF's socket */
+    for (int i = 0; i < rp->sriov_num_vf_bars && i < RPCIE_MAX_BARS; i++) {
+        if (rp->sriov_vf_bar_size[i] == 0) continue;
+
+        RpcieVfBarContext *ctx = g_new0(RpcieVfBarContext, 1);
+        ctx->vf      = vf;
+        ctx->bar_idx = i;
+
+        char name[32];
+        snprintf(name, sizeof(name), "rpcie-vf-bar%d", i);
+        memory_region_init_io(&vf->bar_mr[i], OBJECT(vf),
+                              &rpcie_vf_bar_ops, ctx, name,
+                              rp->sriov_vf_bar_size[i]);
+
+        int pci_type = PCI_BASE_ADDRESS_SPACE_MEMORY;
+        if (rp->sriov_vf_bar_type[i] == RPCIE_BAR_MEM64) {
+            pci_type |= PCI_BASE_ADDRESS_MEM_TYPE_64;
+        }
+        pci_register_bar(d, i, pci_type, &vf->bar_mr[i]);
+
+        if (rp->sriov_vf_bar_type[i] == RPCIE_BAR_MEM64) i++;
+    }
+
+    if (pcie_endpoint_cap_init(d, 0) < 0) {
+        error_setg(errp, "rpcie-vf: failed to init PCIe cap");
+    }
+}
+
+static void rpcie_vf_exit(PCIDevice *d)
+{
+    RemotePciePortVF *vf = REMOTE_PCIE_PORT_VF(d);
+
+    for (int i = 0; i < RPCIE_MAX_BARS; i++) {
+        if (vf->bar_mr[i].size) {
+            g_free(vf->bar_mr[i].opaque);
+        }
+    }
+    pcie_cap_exit(d);
+}
+
+static void rpcie_vf_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->realize   = rpcie_vf_realize;
+    k->exit      = rpcie_vf_exit;
+    k->vendor_id = PCI_VENDOR_ID_REDHAT;
+    k->device_id = 0x0014;  /* overridden by pcie_sriov from PF's SR-IOV cap */
+    k->class_id  = PCI_CLASS_OTHERS;
+
+    dc->desc = "Remote PCIe Endpoint VF (auto-created by SR-IOV)";
+    dc->user_creatable = false;
+}
+
+static const TypeInfo rpcie_vf_info = {
+    .name          = TYPE_REMOTE_PCIE_PORT_VF,
+    .parent        = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(RemotePciePortVF),
+    .class_init    = rpcie_vf_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_PCIE_DEVICE },
+        { }
+    },
+};
+
 static void rpcie_register_types(void)
 {
     type_register_static(&rpcie_info);
+    type_register_static(&rpcie_vf_info);
 }
 
 type_init(rpcie_register_types)

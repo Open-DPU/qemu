@@ -19,13 +19,16 @@
 #define HW_REMOTE_PCIE_PORT_H
 
 #include "hw/pci/pci_device.h"
+#include "hw/pci/pcie_sriov.h"
 #include "hw/remote/rpcie-protocol.h"
 #include "qemu/thread.h"
 #include "qemu/atomic.h"
 #include "qom/object.h"
 
-#define TYPE_REMOTE_PCIE_PORT "remote-pcie-port"
+#define TYPE_REMOTE_PCIE_PORT    "remote-pcie-port"
+#define TYPE_REMOTE_PCIE_PORT_VF "remote-pcie-port-vf"
 OBJECT_DECLARE_SIMPLE_TYPE(RemotePciePort, REMOTE_PCIE_PORT)
+OBJECT_DECLARE_SIMPLE_TYPE(RemotePciePortVF, REMOTE_PCIE_PORT_VF)
 
 #define RPCIE_MAX_BARS          6
 #define RPCIE_CPL_RING_SIZE     256   /* must be power of 2 */
@@ -73,6 +76,25 @@ struct RemotePciePort {
 
     /* Remote BDF (from initial FN_ADD, used in TLP headers) */
     uint16_t     remote_bdf;
+
+    /* SR-IOV state */
+    bool         sriov_capable;
+    uint16_t     sriov_total_vfs;
+    uint16_t     sriov_vf_device_id;
+    uint16_t     sriov_vf_offset;
+    uint16_t     sriov_vf_stride;
+    uint8_t      sriov_num_vf_bars;
+    uint64_t     sriov_vf_bar_size[RPCIE_MAX_BARS];
+    uint8_t      sriov_vf_bar_type[RPCIE_MAX_BARS];
+};
+
+/* VF companion device (auto-created by QEMU's SR-IOV subsystem) */
+struct RemotePciePortVF {
+    /*< private >*/
+    PCIDevice parent_obj;
+    /*< public >*/
+
+    MemoryRegion bar_mr[RPCIE_MAX_BARS];
 };
 
 /* Send a framed message (acquires send_mutex). */
