@@ -4,8 +4,35 @@
  * A PCIe Root Port connected to an external simulation via Unix socket.
  * Raw PCIe TLPs are exchanged using the rpcie wire protocol.
  *
+ * Architecture
+ * ~~~~~~~~~~~~
+ * ┌────────────────────────────┐   Unix socket   ┌───────────────────┐
+ * │  QEMU                      │ ◄═══════════► │  Simulation       │
+ * │  ┌─────────────────────┐   │   rpcie TLPs  │  (Verilator, VCS) │
+ * │  │ remote-pcie-port    │   │               │                   │
+ * │  │   (Root Port)       │   │               │  ┌─────────────┐  │
+ * │  │   ├── proxy BDF 0   │   │  FN_ADD/     │  │ PF 0        │  │
+ * │  │   ├── proxy BDF 1   │   │  FN_REMOVE   │  │ VF 0..N     │  │
+ * │  │   └── proxy BDF N   │   │  ◄──────────── │  │ PF 1..M     │  │
+ * │  └─────────────────────┘   │               │  └─────────────┘  │
+ * └────────────────────────────┘               └───────────────────┘
+ *
+ * Key design decisions:
+ *  - One socket = one PCIe link; all PFs/VFs share it.
+ *  - Proxy devices appear dynamically via FN_ADD control messages.
+ *  - BAR MMIO uses absolute physical addresses for PCIe-faithful modeling.
+ *  - Config space reads are forwarded to the simulation.
+ *  - Config space writes are forwarded AND applied locally so QEMU's
+ *    BAR mapping, MSI-X, MSI, and SR-IOV machinery stays in sync.
+ *  - MSI-X uses msix_init() with the simulation's BAR/offset info so
+ *    guest writes to MSI-X table are captured locally for interrupt
+ *    injection, while other BAR writes are forwarded to the simulation.
+ *  - DMA uses pci_dma_read/write through the proxy's address space
+ *    so IOMMU (VT-d / SMMU) is respected when configured.
+ *  - Sequence numbers are allocated atomically for thread safety.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
- * Copyright 2026 Open-DPU Project
+ * Copyright 2025 Open-DPU Project
  */
 
 #include "qemu/osdep.h"
@@ -23,6 +50,7 @@
 #include "hw/pci/pcie_port.h"
 #include "hw/pci/msix.h"
 #include "hw/pci/msi.h"
+#include "hw/pci/pcie.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "system/dma.h"
@@ -100,11 +128,15 @@ int rpcie_send_msg(RemotePciePort *rp, uint32_t seq,
     return rc;
 }
 
+/*
+ * Thread-safe sequence number allocation.
+ * Downstream requests use odd numbers (+=2).
+ * Uses atomic fetch-add so multiple vCPU threads can safely
+ * issue concurrent BAR reads / config reads.
+ */
 uint32_t rpcie_alloc_seq(RemotePciePort *rp)
 {
-    uint32_t s = rp->next_seq;
-    rp->next_seq += 2;  /* keep odd */
-    return s;
+    return qatomic_fetch_add(&rp->next_seq, 2);
 }
 
 /* ================================================================== */
@@ -131,7 +163,7 @@ int rpcie_send_and_wait(RemotePciePort *rp, uint32_t seq,
 {
     int slot = (seq / 2) % RPCIE_CPL_RING_SIZE;
 
-    /* Clear slot */
+    /* Clear slot before sending (prevents stale match) */
     qemu_mutex_lock(&rp->cpl_mutex);
     rp->cpl_ring[slot].valid = false;
     qemu_mutex_unlock(&rp->cpl_mutex);
@@ -141,17 +173,18 @@ int rpcie_send_and_wait(RemotePciePort *rp, uint32_t seq,
         return -1;
     }
 
-    /* Wait for completion */
+    /* Wait for completion with timeout */
     qemu_mutex_lock(&rp->cpl_mutex);
     int64_t deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + timeout_ms;
+
     while (!rp->cpl_ring[slot].valid || rp->cpl_ring[slot].seq != seq) {
         int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         if (now >= deadline) {
             qemu_mutex_unlock(&rp->cpl_mutex);
-            error_report("rpcie: completion timeout for seq %u", seq);
+            error_report("rpcie: completion timeout for seq %u (slot %d)",
+                         seq, slot);
             return -1;
         }
-        /* Wait with 100ms intervals to recheck */
         qemu_cond_timedwait(&rp->cpl_cond, &rp->cpl_mutex,
                             deadline - now);
     }
@@ -168,6 +201,42 @@ int rpcie_send_and_wait(RemotePciePort *rp, uint32_t seq,
 }
 
 /* ================================================================== */
+/*  Helpers                                                           */
+/* ================================================================== */
+
+/*
+ * Compute the absolute physical address for a BAR region access.
+ * reads the BAR base directly from config space so it always
+ * reflects what the guest has programmed.
+ */
+static uint64_t rpcie_bar_phys_addr(PCIDevice *d, int bar_idx,
+                                    uint8_t bar_type, hwaddr offset)
+{
+    uint32_t bar_lo = pci_get_long(
+        d->config + PCI_BASE_ADDRESS_0 + 4 * bar_idx);
+    uint64_t base;
+
+    if (bar_type == RPCIE_BAR_IO) {
+        base = bar_lo & PCI_BASE_ADDRESS_IO_MASK;
+    } else {
+        base = bar_lo & PCI_BASE_ADDRESS_MEM_MASK;
+        if (bar_type == RPCIE_BAR_MEM64) {
+            uint32_t bar_hi = pci_get_long(
+                d->config + PCI_BASE_ADDRESS_0 + 4 * (bar_idx + 1));
+            base |= (uint64_t)bar_hi << 32;
+        }
+    }
+    return base + offset;
+}
+
+/* Find the proxy device for a given simulation-side BDF. */
+static RemotePcieProxy *rpcie_find_proxy(RemotePciePort *rp, uint16_t bdf)
+{
+    uint8_t devfn = (RPCIE_BDF_DEV(bdf) << 3) | RPCIE_BDF_FN(bdf);
+    return rp->proxies[devfn];
+}
+
+/* ================================================================== */
 /*  Proxy BAR MMIO operations (forwarded to simulation)               */
 /* ================================================================== */
 
@@ -181,17 +250,26 @@ static uint64_t rpcie_bar_read(void *opaque, hwaddr addr, unsigned size)
     RpcieBarContext *ctx = opaque;
     RemotePcieProxy *proxy = ctx->proxy;
     RemotePciePort  *rp = proxy->rp;
+    PCIDevice       *pci_dev = PCI_DEVICE(proxy);
 
-    /* Build MRd32 TLP (32-bit address sufficient for BAR-relative) */
+    /* Compute absolute physical address for PCIe-faithful TLP */
+    uint64_t phys_addr = rpcie_bar_phys_addr(
+        pci_dev, ctx->bar_idx, proxy->bar_type[ctx->bar_idx], addr);
+
+    /* Build MRd TLP — use 64-bit header if address exceeds 4 GB */
     rpcie_tlp_mem_t tlp;
     memset(&tlp, 0, sizeof(tlp));
-    tlp.hdr.fmt_type     = RPCIE_TLP_MRD32;
+    if (phys_addr > UINT32_MAX) {
+        tlp.hdr.fmt_type = RPCIE_TLP_MRD64;
+    } else {
+        tlp.hdr.fmt_type = RPCIE_TLP_MRD32;
+    }
     tlp.hdr.tc_attr      = 0;
     tlp.hdr.length_dw    = (size + 3) / 4;
     tlp.hdr.requester_id = 0; /* root complex */
     tlp.hdr.tag          = 0;
     tlp.hdr.byte_enables = rpcie_compute_first_be((uint32_t)addr, size);
-    tlp.address          = addr;
+    tlp.address          = phys_addr;
 
     uint32_t seq = rpcie_alloc_seq(rp);
     uint32_t cpl_data = 0xFFFFFFFF;
@@ -206,9 +284,13 @@ static uint64_t rpcie_bar_read(void *opaque, hwaddr addr, unsigned size)
         return 0xFFFFFFFF;
     }
 
-    /* Mask to requested size */
-    uint64_t mask = (size < 4) ? ((1ULL << (size * 8)) - 1) : 0xFFFFFFFF;
-    return cpl_data & mask;
+    /* Extract requested bytes from completion DW */
+    int shift = ((int)addr & 3) * 8;
+    uint64_t result = (uint64_t)cpl_data >> shift;
+    if (size < 4) {
+        result &= (1ULL << (size * 8)) - 1;
+    }
+    return result;
 }
 
 static void rpcie_bar_write(void *opaque, hwaddr addr,
@@ -217,22 +299,30 @@ static void rpcie_bar_write(void *opaque, hwaddr addr,
     RpcieBarContext *ctx = opaque;
     RemotePcieProxy *proxy = ctx->proxy;
     RemotePciePort  *rp = proxy->rp;
+    PCIDevice       *pci_dev = PCI_DEVICE(proxy);
 
-    /* Build MWr32 TLP + data payload */
+    uint64_t phys_addr = rpcie_bar_phys_addr(
+        pci_dev, ctx->bar_idx, proxy->bar_type[ctx->bar_idx], addr);
+
+    /* Build MWr TLP + data payload */
     uint8_t buf[sizeof(rpcie_tlp_mem_t) + 4];
     rpcie_tlp_mem_t *tlp = (rpcie_tlp_mem_t *)buf;
 
     memset(buf, 0, sizeof(buf));
-    tlp->hdr.fmt_type     = RPCIE_TLP_MWR32;
+    if (phys_addr > UINT32_MAX) {
+        tlp->hdr.fmt_type = RPCIE_TLP_MWR64;
+    } else {
+        tlp->hdr.fmt_type = RPCIE_TLP_MWR32;
+    }
     tlp->hdr.tc_attr      = 0;
     tlp->hdr.length_dw    = 1;
-    tlp->hdr.requester_id = 0;
+    tlp->hdr.requester_id = 0; /* root complex */
     tlp->hdr.tag          = 0;
     tlp->hdr.byte_enables = rpcie_compute_first_be((uint32_t)addr, size);
-    tlp->address          = addr;
+    tlp->address          = phys_addr;
 
-    /* Append data after the TLP header */
-    uint32_t wdata = (uint32_t)data;
+    /* Place write data in DW alignment */
+    uint32_t wdata = (uint32_t)(data << (((int)addr & 3) * 8));
     memcpy(buf + sizeof(rpcie_tlp_mem_t), &wdata, 4);
 
     uint32_t seq = rpcie_alloc_seq(rp);
@@ -260,12 +350,17 @@ static uint32_t rpcie_proxy_config_read(PCIDevice *d,
     RemotePcieProxy *proxy = REMOTE_PCIE_PROXY(d);
     RemotePciePort  *rp = proxy->rp;
 
+    /* Don't forward if socket is down (return local config) */
+    if (rp->conn_fd < 0 || !rp->rx_running) {
+        return pci_default_read_config(d, address, len);
+    }
+
     rpcie_tlp_cfg_t tlp;
     memset(&tlp, 0, sizeof(tlp));
     tlp.hdr.fmt_type     = RPCIE_TLP_CFGRD0;
     tlp.hdr.tc_attr      = 0;
     tlp.hdr.length_dw    = 1;
-    tlp.hdr.requester_id = 0;
+    tlp.hdr.requester_id = 0; /* root complex */
     tlp.hdr.tag          = 0;
     tlp.hdr.byte_enables = rpcie_compute_first_be(address, len);
     tlp.completer_id     = proxy->remote_bdf;
@@ -283,7 +378,7 @@ static uint32_t rpcie_proxy_config_read(PCIDevice *d,
         return 0xFFFFFFFF;
     }
 
-    /* Shift the result for sub-DW access */
+    /* Extract sub-DW access */
     int shift = (address & 3) * 8;
     uint32_t result = cpl_data >> shift;
     if (len < 4) {
@@ -298,6 +393,24 @@ static void rpcie_proxy_config_write(PCIDevice *d, uint32_t address,
     RemotePcieProxy *proxy = REMOTE_PCIE_PROXY(d);
     RemotePciePort  *rp = proxy->rp;
 
+    /*
+     * 1) Apply locally so QEMU's BAR mapping, MSI-X, MSI, and
+     *    SR-IOV state tracking stay in sync with the guest.
+     *    pci_default_write_config() calls:
+     *      - pci_update_mappings() → BAR address changes
+     *      - msi_write_config()    → MSI enable/disable
+     *      - msix_write_config()   → MSI-X enable/disable
+     *      - pcie_sriov_config_write() → SR-IOV
+     */
+    pci_default_write_config(d, address, val, len);
+
+    /*
+     * 2) Forward to simulation.
+     */
+    if (rp->conn_fd < 0 || !rp->rx_running) {
+        return;
+    }
+
     uint8_t buf[sizeof(rpcie_tlp_cfg_t) + 4];
     rpcie_tlp_cfg_t *tlp = (rpcie_tlp_cfg_t *)buf;
 
@@ -305,7 +418,7 @@ static void rpcie_proxy_config_write(PCIDevice *d, uint32_t address,
     tlp->hdr.fmt_type     = RPCIE_TLP_CFGWR0;
     tlp->hdr.tc_attr      = 0;
     tlp->hdr.length_dw    = 1;
-    tlp->hdr.requester_id = 0;
+    tlp->hdr.requester_id = 0; /* root complex */
     tlp->hdr.tag          = 0;
     tlp->hdr.byte_enables = rpcie_compute_first_be(address, len);
     tlp->completer_id     = proxy->remote_bdf;
@@ -319,9 +432,28 @@ static void rpcie_proxy_config_write(PCIDevice *d, uint32_t address,
     uint32_t cpl_data;
     uint8_t  cpl_status;
 
-    /* Config writes get a completion (Cpl) */
+    /* Config writes get a Cpl (non-posted) */
     rpcie_send_and_wait(rp, seq, buf, sizeof(rpcie_tlp_cfg_t) + 4,
                         &cpl_data, &cpl_status, 5000);
+
+    /*
+     * 3) Detect FLR trigger: guest wrote PCI_EXP_DEVCTL with BCR_FLR bit.
+     *    Forward as a RESET control message.
+     */
+    if (proxy->flr_capable && d->exp.exp_cap &&
+        ranges_overlap(address, len,
+                       d->exp.exp_cap + PCI_EXP_DEVCTL, 2)) {
+        uint16_t devctl = pci_get_word(
+            d->config + d->exp.exp_cap + PCI_EXP_DEVCTL);
+        if (devctl & PCI_EXP_DEVCTL_BCR_FLR) {
+            rpcie_ctrl_reset_t rst = {
+                .msg_type   = RPCIE_CTRL_RESET,
+                .reset_type = RPCIE_RESET_FLR,
+                .target_bdf = proxy->remote_bdf,
+            };
+            rpcie_send_msg(rp, rpcie_alloc_seq(rp), &rst, sizeof(rst));
+        }
+    }
 }
 
 /* ================================================================== */
@@ -336,13 +468,17 @@ typedef struct RpcieFnAddWork {
     rpcie_ctrl_fn_add_t fn;
     rpcie_bar_desc_t    bars[RPCIE_MAX_BARS];
     rpcie_msix_info_t   msix_info;
+    rpcie_msi_info_t    msi_info;
     bool                has_msix;
+    bool                has_msi;
 } RpcieFnAddWork;
 
 typedef struct RpcieFnRemoveWork {
     RemotePciePort *rp;
     uint16_t        bdf;
 } RpcieFnRemoveWork;
+
+/* --- Completion handling ------------------------------------------ */
 
 static void rpcie_rx_handle_cpl(RemotePciePort *rp, uint32_t seq,
                                 const uint8_t *payload, uint32_t len)
@@ -364,6 +500,8 @@ static void rpcie_rx_handle_cpl(RemotePciePort *rp, uint32_t seq,
     rpcie_deliver_completion(rp, seq, status, data);
 }
 
+/* --- DMA write (sim → host memory) -------------------------------- */
+
 static void rpcie_rx_handle_dma_write(RemotePciePort *rp,
                                       const uint8_t *payload, uint32_t len)
 {
@@ -377,15 +515,28 @@ static void rpcie_rx_handle_dma_write(RemotePciePort *rp,
     const uint8_t *data = payload + sizeof(rpcie_tlp_mem_t);
 
     if (len < sizeof(rpcie_tlp_mem_t) + data_bytes) {
+        error_report("rpcie: DMA write truncated (need %u+%u, got %u)",
+                     (uint32_t)sizeof(rpcie_tlp_mem_t), data_bytes, len);
         return;
     }
 
-    /* Write into guest RAM */
-    PCIDevice *pci_dev = PCI_DEVICE(rp);
-    dma_memory_write(&address_space_memory, addr, data, data_bytes,
-                     MEMTXATTRS_UNSPECIFIED);
-    (void)pci_dev;
+    /*
+     * Find the originating proxy by requester BDF so DMA goes through
+     * the proxy's AddressSpace (respects IOMMU if configured).
+     */
+    uint16_t req_bdf = tlp->hdr.requester_id;
+    RemotePcieProxy *proxy = rpcie_find_proxy(rp, req_bdf);
+
+    if (proxy) {
+        pci_dma_write(PCI_DEVICE(proxy), addr, data, data_bytes);
+    } else {
+        /* Fallback to flat address space (no IOMMU) */
+        dma_memory_write(&address_space_memory, addr, data, data_bytes,
+                         MEMTXATTRS_UNSPECIFIED);
+    }
 }
+
+/* --- DMA read (sim reads host memory) ------------------------------ */
 
 static void rpcie_rx_handle_dma_read(RemotePciePort *rp, uint32_t seq,
                                      const uint8_t *payload, uint32_t len)
@@ -398,14 +549,14 @@ static void rpcie_rx_handle_dma_read(RemotePciePort *rp, uint32_t seq,
     uint16_t ndw  = tlp->hdr.length_dw ? tlp->hdr.length_dw : 1024;
     uint32_t data_bytes = ndw * 4;
 
-    /* Read from guest RAM */
-    uint8_t buf[sizeof(rpcie_tlp_cpl_t) + RPCIE_MAX_PAYLOAD];
-    rpcie_tlp_cpl_t *cpl = (rpcie_tlp_cpl_t *)buf;
-
     if (data_bytes > RPCIE_MAX_PAYLOAD) {
         data_bytes = RPCIE_MAX_PAYLOAD;
         ndw = data_bytes / 4;
     }
+
+    /* Build CplD response */
+    uint8_t buf[sizeof(rpcie_tlp_cpl_t) + RPCIE_MAX_PAYLOAD];
+    rpcie_tlp_cpl_t *cpl = (rpcie_tlp_cpl_t *)buf;
 
     rpcie_build_cpld(cpl,
                      0,                          /* completer = RC */
@@ -416,15 +567,26 @@ static void rpcie_rx_handle_dma_read(RemotePciePort *rp, uint32_t seq,
                      (uint8_t)(addr & 0x7F),
                      ndw);
 
-    dma_memory_read(&address_space_memory, addr,
-                    buf + sizeof(rpcie_tlp_cpl_t), data_bytes,
-                    MEMTXATTRS_UNSPECIFIED);
+    /* Read through proxy's AddressSpace if available */
+    uint16_t req_bdf = tlp->hdr.requester_id;
+    RemotePcieProxy *proxy = rpcie_find_proxy(rp, req_bdf);
+
+    if (proxy) {
+        pci_dma_read(PCI_DEVICE(proxy), addr,
+                     buf + sizeof(rpcie_tlp_cpl_t), data_bytes);
+    } else {
+        dma_memory_read(&address_space_memory, addr,
+                        buf + sizeof(rpcie_tlp_cpl_t), data_bytes,
+                        MEMTXATTRS_UNSPECIFIED);
+    }
 
     rpcie_send_msg(rp, seq, buf, sizeof(rpcie_tlp_cpl_t) + data_bytes);
 }
 
-static void rpcie_rx_handle_msix(RemotePciePort *rp,
-                                 const uint8_t *payload, uint32_t len)
+/* --- MSI-X / MSI interrupt notification ---------------------------- */
+
+static void rpcie_rx_handle_interrupt(RemotePciePort *rp,
+                                      const uint8_t *payload, uint32_t len)
 {
     if (len < sizeof(rpcie_tlp_msg_t)) {
         return;
@@ -432,11 +594,9 @@ static void rpcie_rx_handle_msix(RemotePciePort *rp,
     const rpcie_tlp_msg_t *msg = (const rpcie_tlp_msg_t *)payload;
     uint16_t req_bdf = msg->hdr.requester_id;
 
-    /* Find the proxy for this BDF */
-    uint8_t devfn = (RPCIE_BDF_DEV(req_bdf) << 3) | RPCIE_BDF_FN(req_bdf);
-    RemotePcieProxy *proxy = rp->proxies[devfn];
+    RemotePcieProxy *proxy = rpcie_find_proxy(rp, req_bdf);
     if (!proxy) {
-        error_report("rpcie: MSI-X for unknown devfn 0x%02x", devfn);
+        error_report("rpcie: interrupt for unknown BDF %04x", req_bdf);
         return;
     }
 
@@ -445,18 +605,105 @@ static void rpcie_rx_handle_msix(RemotePciePort *rp,
     if (len >= sizeof(rpcie_tlp_msg_t) + 4) {
         memcpy(&msi_data, payload + sizeof(rpcie_tlp_msg_t), 4);
     }
-    uint16_t vector = msi_data & 0x7FF; /* MSI-X vector is low bits */
+    uint16_t vector = msi_data & 0x7FF;
 
-    if (proxy->has_msix && msix_present(&proxy->parent_obj)) {
-        msix_notify(&proxy->parent_obj, vector);
+    PCIDevice *pci_dev = PCI_DEVICE(proxy);
+
+    if (msg->msg_code == RPCIE_MSG_MSIX_NOTIFY) {
+        if (proxy->has_msix && msix_present(pci_dev)) {
+            msix_notify(pci_dev, vector);
+        }
+    } else if (msg->msg_code == RPCIE_MSG_MSI_NOTIFY) {
+        if (proxy->has_msi && msi_enabled(pci_dev)) {
+            msi_notify(pci_dev, vector);
+        }
     }
 }
+
+/* --- INTx assert/deassert ----------------------------------------- */
+
+static void rpcie_rx_handle_intx(RemotePciePort *rp,
+                                 const uint8_t *payload, uint32_t len)
+{
+    if (len < sizeof(rpcie_tlp_msg_t)) {
+        return;
+    }
+    const rpcie_tlp_msg_t *msg = (const rpcie_tlp_msg_t *)payload;
+    uint16_t req_bdf = msg->hdr.requester_id;
+
+    RemotePcieProxy *proxy = rpcie_find_proxy(rp, req_bdf);
+    if (!proxy) {
+        return;
+    }
+
+    int level;
+    if (msg->msg_code == RPCIE_MSG_INTX_ASSERT) {
+        level = 1;
+    } else if (msg->msg_code == RPCIE_MSG_INTX_DEASSERT) {
+        level = 0;
+    } else {
+        return;
+    }
+
+    if (proxy->intx_level != level) {
+        proxy->intx_level = level;
+        pci_set_irq(PCI_DEVICE(proxy), level);
+    }
+}
+
+/* --- AER error message -------------------------------------------- */
+
+static void rpcie_rx_handle_aer(RemotePciePort *rp,
+                                const uint8_t *payload, uint32_t len)
+{
+    if (len < sizeof(rpcie_tlp_msg_t)) {
+        return;
+    }
+    const rpcie_tlp_msg_t *msg = (const rpcie_tlp_msg_t *)payload;
+
+    /*
+     * Forward AER error to root port.  In QEMU, AER is handled by
+     * the root port's AER capability.  We inject the error using
+     * pcie_aer_inject_error() or by directly signaling the root port.
+     *
+     * For now, log the error and signal the root port MSI.
+     * A complete implementation would parse the AER TLP-level error
+     * info (header log, source ID) and update the root port's AER
+     * registers.
+     */
+    const char *sev;
+    switch (msg->msg_code) {
+    case RPCIE_MSG_AER_ERR_COR:
+        sev = "correctable";
+        break;
+    case RPCIE_MSG_AER_ERR_NONFATAL:
+        sev = "non-fatal";
+        break;
+    case RPCIE_MSG_AER_ERR_FATAL:
+        sev = "fatal";
+        break;
+    default:
+        sev = "unknown";
+        break;
+    }
+
+    info_report("rpcie: AER %s error from BDF %04x",
+                sev, msg->hdr.requester_id);
+
+    /* Signal root port's AER interrupt (vector 0) */
+    PCIDevice *rp_dev = PCI_DEVICE(rp);
+    if (msix_present(rp_dev)) {
+        msix_notify(rp_dev, 0);
+    }
+}
+
+/* --- FN_ADD / FN_REMOVE parsing ----------------------------------- */
 
 static void rpcie_rx_handle_fn_add(RemotePciePort *rp,
                                    const uint8_t *payload, uint32_t plen)
 {
     if (plen < sizeof(rpcie_ctrl_fn_add_t)) {
-        error_report("rpcie: FN_ADD too short");
+        error_report("rpcie: FN_ADD too short (%u bytes)", plen);
         return;
     }
 
@@ -468,7 +715,9 @@ static void rpcie_rx_handle_fn_add(RemotePciePort *rp,
     const uint8_t *p = payload + sizeof(rpcie_ctrl_fn_add_t);
     uint32_t remaining = plen - sizeof(rpcie_ctrl_fn_add_t);
     int nb = work->fn.num_bars;
-    if (nb > RPCIE_MAX_BARS) nb = RPCIE_MAX_BARS;
+    if (nb > RPCIE_MAX_BARS) {
+        nb = RPCIE_MAX_BARS;
+    }
 
     for (int i = 0; i < nb && remaining >= sizeof(rpcie_bar_desc_t); i++) {
         memcpy(&work->bars[i], p, sizeof(rpcie_bar_desc_t));
@@ -484,7 +733,15 @@ static void rpcie_rx_handle_fn_add(RemotePciePort *rp,
         remaining -= sizeof(rpcie_msix_info_t);
     }
 
-    /* Schedule on main loop */
+    /* Parse MSI info if present */
+    if (work->fn.has_msi && remaining >= sizeof(rpcie_msi_info_t)) {
+        memcpy(&work->msi_info, p, sizeof(rpcie_msi_info_t));
+        work->has_msi = true;
+        p         += sizeof(rpcie_msi_info_t);
+        remaining -= sizeof(rpcie_msi_info_t);
+    }
+
+    /* Schedule on main loop (device creation must happen there) */
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             rpcie_handle_fn_add_bh, work);
 }
@@ -495,7 +752,8 @@ static void rpcie_rx_handle_fn_remove(RemotePciePort *rp,
     if (plen < sizeof(rpcie_ctrl_fn_remove_t)) {
         return;
     }
-    const rpcie_ctrl_fn_remove_t *msg = (const rpcie_ctrl_fn_remove_t *)payload;
+    const rpcie_ctrl_fn_remove_t *msg =
+        (const rpcie_ctrl_fn_remove_t *)payload;
 
     RpcieFnRemoveWork *work = g_new0(RpcieFnRemoveWork, 1);
     work->rp  = rp;
@@ -504,6 +762,10 @@ static void rpcie_rx_handle_fn_remove(RemotePciePort *rp,
     aio_bh_schedule_oneshot(qemu_get_aio_context(),
                             rpcie_handle_fn_remove_bh, work);
 }
+
+/* ================================================================== */
+/*  RX thread main loop                                               */
+/* ================================================================== */
 
 static void *rpcie_rx_thread_fn(void *opaque)
 {
@@ -565,7 +827,8 @@ static void *rpcie_rx_thread_fn(void *opaque)
                 rp->rx_running = false;
                 break;
             case RPCIE_CTRL_RESET:
-                /* FLR ack from simulation — ignored for now */
+                /* FLR ack or reset ack from simulation */
+                info_report("rpcie: reset acknowledged");
                 break;
             default:
                 error_report("rpcie: unknown control msg 0x%02x", fmt_type);
@@ -580,13 +843,41 @@ static void *rpcie_rx_thread_fn(void *opaque)
         } else if (fmt_type == RPCIE_TLP_MSGD &&
                    plen >= sizeof(rpcie_tlp_msg_t)) {
             const rpcie_tlp_msg_t *msg = (const rpcie_tlp_msg_t *)buf;
-            if (msg->msg_code == RPCIE_MSG_MSIX_NOTIFY ||
-                msg->msg_code == RPCIE_MSG_MSI_NOTIFY) {
-                rpcie_rx_handle_msix(rp, buf, plen);
-            } else {
-                /* INTx, AER, PME — TODO */
+            switch (msg->msg_code) {
+            case RPCIE_MSG_MSIX_NOTIFY:
+            case RPCIE_MSG_MSI_NOTIFY:
+                rpcie_rx_handle_interrupt(rp, buf, plen);
+                break;
+            case RPCIE_MSG_INTX_ASSERT:
+            case RPCIE_MSG_INTX_DEASSERT:
+                rpcie_rx_handle_intx(rp, buf, plen);
+                break;
+            case RPCIE_MSG_AER_ERR_COR:
+            case RPCIE_MSG_AER_ERR_NONFATAL:
+            case RPCIE_MSG_AER_ERR_FATAL:
+                rpcie_rx_handle_aer(rp, buf, plen);
+                break;
+            case RPCIE_MSG_PME:
+                info_report("rpcie: PME from BDF %04x (TODO: forward)",
+                            msg->hdr.requester_id);
+                break;
+            default:
                 error_report("rpcie: unhandled msg code 0x%02x",
                              msg->msg_code);
+                break;
+            }
+        } else if (fmt_type == RPCIE_TLP_MSG &&
+                   plen >= sizeof(rpcie_tlp_msg_t)) {
+            /* Message without data — same dispatch */
+            const rpcie_tlp_msg_t *msg = (const rpcie_tlp_msg_t *)buf;
+            switch (msg->msg_code) {
+            case RPCIE_MSG_INTX_ASSERT:
+            case RPCIE_MSG_INTX_DEASSERT:
+                rpcie_rx_handle_intx(rp, buf, plen);
+                break;
+            default:
+                error_report("rpcie: unhandled MSG 0x%02x", msg->msg_code);
+                break;
             }
         } else {
             error_report("rpcie: unhandled TLP type 0x%02x", fmt_type);
@@ -636,15 +927,41 @@ static void rpcie_handle_fn_add_bh(void *opaque)
         proxy->num_bars = RPCIE_PROXY_MAX_BARS;
     }
 
+    /* PCI identity */
+    proxy->vendor_id       = work->fn.vendor_id;
+    proxy->device_id       = work->fn.device_id;
+    proxy->subsys_vendor_id = work->fn.subsys_vendor_id;
+    proxy->subsys_id       = work->fn.subsys_id;
+    memcpy(proxy->class_code, work->fn.class_code, 3);
+    proxy->revision        = work->fn.revision;
+
     /* Copy BAR info */
     for (int i = 0; i < proxy->num_bars; i++) {
-        proxy->bar_size[i] = work->bars[i].size;
-        proxy->bar_type[i] = work->bars[i].type;
+        proxy->bar_size[i]         = work->bars[i].size;
+        proxy->bar_type[i]         = work->bars[i].type;
+        proxy->bar_prefetchable[i] = work->bars[i].prefetchable;
     }
 
     /* Copy MSI-X info */
     proxy->has_msix     = work->has_msix;
-    proxy->msix_vectors = work->has_msix ? work->msix_info.table_size : 0;
+    if (work->has_msix) {
+        proxy->msix_vectors      = work->msix_info.table_size;
+        proxy->msix_table_bar    = work->msix_info.table_bar;
+        proxy->msix_table_offset = work->msix_info.table_offset;
+        proxy->msix_pba_bar      = work->msix_info.pba_bar;
+        proxy->msix_pba_offset   = work->msix_info.pba_offset;
+    }
+
+    /* Copy MSI info */
+    proxy->has_msi = work->has_msi;
+    if (work->has_msi) {
+        proxy->msi_vectors        = work->msi_info.num_vectors;
+        proxy->msi_64bit          = work->msi_info.is_64bit;
+        proxy->msi_per_vector_mask = work->msi_info.per_vector_mask;
+    }
+
+    /* FLR */
+    proxy->flr_capable  = work->fn.flr_capable;
 
     /* Place on the secondary bus at the right devfn */
     PCI_DEVICE(dev)->devfn = devfn;
@@ -656,14 +973,35 @@ static void rpcie_handle_fn_add_bh(void *opaque)
         return;
     }
 
+    /*
+     * Set PCI identity in local config space.  pci_qdev_realize() writes
+     * the class vendor/device_id (0xFFFF) into config[]; overwrite them
+     * now so QEMU-internal code (and lspci in the guest, if it falls back
+     * to local config) sees correct values.
+     */
+    PCIDevice *pci_dev = PCI_DEVICE(proxy);
+    pci_config_set_vendor_id(pci_dev->config, proxy->vendor_id);
+    pci_config_set_device_id(pci_dev->config, proxy->device_id);
+    pci_set_word(pci_dev->config + PCI_SUBSYSTEM_VENDOR_ID,
+                 proxy->subsys_vendor_id);
+    pci_set_word(pci_dev->config + PCI_SUBSYSTEM_ID, proxy->subsys_id);
+    pci_config_set_class(pci_dev->config,
+                         ((uint16_t)proxy->class_code[2] << 8) |
+                         proxy->class_code[1]);
+    pci_config_set_prog_interface(pci_dev->config, proxy->class_code[0]);
+    pci_set_byte(pci_dev->config + PCI_REVISION_ID, proxy->revision);
+
     rp->proxies[devfn] = proxy;
 
-    info_report("rpcie: added function %02x:%02x.%x (%s, %04x:%04x, %d BARs%s)",
+    info_report("rpcie: added function %02x:%02x.%x (%s, %04x:%04x, "
+                "%d BARs%s%s%s)",
                 RPCIE_BDF_BUS(bdf), RPCIE_BDF_DEV(bdf), RPCIE_BDF_FN(bdf),
                 proxy->is_vf ? "VF" : "PF",
-                work->fn.vendor_id, work->fn.device_id,
+                proxy->vendor_id, proxy->device_id,
                 proxy->num_bars,
-                proxy->has_msix ? ", MSI-X" : "");
+                proxy->has_msix ? ", MSI-X" : "",
+                proxy->has_msi  ? ", MSI"   : "",
+                proxy->flr_capable ? ", FLR" : "");
 
     g_free(work);
 }
@@ -702,7 +1040,8 @@ static int rpcie_do_handshake(RemotePciePort *rp)
         .msg_type     = RPCIE_CTRL_HANDSHAKE,
         .version      = RPCIE_PROTOCOL_VERSION,
         .capabilities = RPCIE_CAP_SRIOV | RPCIE_CAP_AER |
-                        RPCIE_CAP_SHM | RPCIE_CAP_FLR,
+                        RPCIE_CAP_SHM | RPCIE_CAP_FLR |
+                        RPCIE_CAP_HOTPLUG,
     };
 
     uint32_t seq = rpcie_alloc_seq(rp);
@@ -718,25 +1057,30 @@ static int rpcie_do_handshake(RemotePciePort *rp)
         return -1;
     }
     if (hdr.magic != RPCIE_MAGIC) {
-        error_report("rpcie: bad handshake ack magic");
+        error_report("rpcie: bad handshake ack magic 0x%08x", hdr.magic);
         return -1;
     }
 
     rpcie_ctrl_handshake_t ack;
     if (hdr.length < sizeof(ack)) {
-        error_report("rpcie: handshake ack too short");
+        error_report("rpcie: handshake ack too short (%u)", hdr.length);
         return -1;
     }
     if (rpcie_recv_full(rp->conn_fd, &ack, sizeof(ack)) < 0) {
         error_report("rpcie: failed to read handshake ack body");
         return -1;
     }
-    /* Drain any extra bytes */
+    /* Drain any extra bytes (forward compatibility) */
     if (hdr.length > sizeof(ack)) {
         uint8_t drain[256];
         uint32_t extra = hdr.length - sizeof(ack);
-        if (extra > sizeof(drain)) extra = sizeof(drain);
-        rpcie_recv_full(rp->conn_fd, drain, extra);
+        while (extra > 0) {
+            uint32_t chunk = extra > sizeof(drain) ? sizeof(drain) : extra;
+            if (rpcie_recv_full(rp->conn_fd, drain, chunk) < 0) {
+                break;
+            }
+            extra -= chunk;
+        }
     }
 
     if (ack.msg_type != RPCIE_CTRL_HANDSHAKE_ACK) {
@@ -773,7 +1117,11 @@ static int rpcie_setup_socket(RemotePciePort *rp, Error **errp)
     strncpy(addr.sun_path, rp->socket_path, sizeof(addr.sun_path) - 1);
 
     if (rp->server) {
-        /* Server mode: create socket, bind, listen, wait for connection */
+        /*
+         * Server mode: create socket, bind, listen, accept.
+         * Uses a generous timeout (60s) to avoid blocking QEMU
+         * indefinitely if the simulation is slow to start.
+         */
         rp->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (rp->listen_fd < 0) {
             error_setg_errno(errp, errno, "rpcie: socket()");
@@ -795,9 +1143,19 @@ static int rpcie_setup_socket(RemotePciePort *rp, Error **errp)
             return -1;
         }
 
-        info_report("rpcie: listening on %s", rp->socket_path);
+        info_report("rpcie: listening on %s (waiting up to 60s)", rp->socket_path);
 
-        /* Accept (blocking — this happens during realize) */
+        /* Accept with timeout */
+        struct pollfd pfd = { .fd = rp->listen_fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 60000); /* 60 seconds */
+        if (pr <= 0) {
+            error_setg(errp, "rpcie: accept timeout (no simulation connected "
+                       "within 60s)");
+            close(rp->listen_fd);
+            rp->listen_fd = -1;
+            return -1;
+        }
+
         rp->conn_fd = accept(rp->listen_fd, NULL, NULL);
         if (rp->conn_fd < 0) {
             error_setg_errno(errp, errno, "rpcie: accept()");
@@ -939,7 +1297,7 @@ static void rpcie_rp_realize(DeviceState *dev, Error **errp)
     qemu_cond_init(&rp->cpl_cond);
     memset(rp->cpl_ring, 0, sizeof(rp->cpl_ring));
     memset(rp->proxies, 0, sizeof(rp->proxies));
-    rp->next_seq = 1; /* odd numbers for downstream */
+    rp->next_seq  = 1; /* odd numbers for downstream */
     rp->listen_fd = -1;
     rp->conn_fd   = -1;
     rp->shm_fd    = -1;
@@ -982,7 +1340,6 @@ static void rpcie_rp_exit(PCIDevice *d)
         /* Send LINK_DOWN */
         rpcie_ctrl_link_t link_dn = { .msg_type = RPCIE_CTRL_LINK_DOWN };
         rpcie_send_msg(rp, rpcie_alloc_seq(rp), &link_dn, sizeof(link_dn));
-
         shutdown(rp->conn_fd, SHUT_RDWR);
     }
     qemu_thread_join(&rp->rx_thread);
@@ -1087,10 +1444,6 @@ static void rpcie_proxy_realize(PCIDevice *d, Error **errp)
 {
     RemotePcieProxy *proxy = REMOTE_PCIE_PROXY(d);
 
-    /* Set PCI identity from FN_ADD data */
-    /* (These are read via config_read forwarding, but set vendor/device
-     *  in local config space so the PCI scan picks them up) */
-
     /* Register BARs */
     for (int i = 0; i < proxy->num_bars; i++) {
         if (proxy->bar_type[i] == RPCIE_BAR_DISABLED ||
@@ -1099,7 +1452,7 @@ static void rpcie_proxy_realize(PCIDevice *d, Error **errp)
         }
 
         RpcieBarContext *ctx = g_new0(RpcieBarContext, 1);
-        ctx->proxy  = proxy;
+        ctx->proxy   = proxy;
         ctx->bar_idx = i;
 
         char name[32];
@@ -1116,6 +1469,9 @@ static void rpcie_proxy_realize(PCIDevice *d, Error **errp)
         if (proxy->bar_type[i] == RPCIE_BAR_IO) {
             pci_type = PCI_BASE_ADDRESS_SPACE_IO;
         }
+        if (proxy->bar_prefetchable[i]) {
+            pci_type |= PCI_BASE_ADDRESS_MEM_PREFETCH;
+        }
 
         pci_register_bar(d, i, pci_type, &proxy->bar_mr[i]);
 
@@ -1125,20 +1481,62 @@ static void rpcie_proxy_realize(PCIDevice *d, Error **errp)
         }
     }
 
-    /* Initialize MSI-X if requested */
+    /*
+     * Initialize MSI-X using the simulation's BAR/offset info.
+     * The MSI-X table and PBA regions are placed as sub-regions of
+     * the appropriate BAR MemoryRegions, so guest writes to the
+     * MSI-X table area are captured by QEMU's MSI-X handler for
+     * local interrupt injection.  All other BAR writes pass through
+     * to the simulation via rpcie_bar_ops.
+     *
+     * cap_pos is set to a fixed offset (0x40) for QEMU-internal use.
+     * The guest sees the real MSI-X cap offset through config read
+     * forwarding.
+     */
     if (proxy->has_msix && proxy->msix_vectors > 0) {
-        /* Use an exclusive BAR for MSI-X (BAR 0 or a free one) */
-        int msix_bar = proxy->num_bars; /* use the first free BAR */
-        if (msix_bar >= RPCIE_PROXY_MAX_BARS) {
-            msix_bar = RPCIE_PROXY_MAX_BARS - 1;
-        }
+        uint8_t tbar = proxy->msix_table_bar;
+        uint8_t pbar = proxy->msix_pba_bar;
 
-        int rc = msix_init_exclusive_bar(d, proxy->msix_vectors,
-                                         msix_bar, errp);
+        /* Validate BAR indices */
+        if (tbar < proxy->num_bars && pbar < proxy->num_bars &&
+            proxy->bar_mr[tbar].size > 0 && proxy->bar_mr[pbar].size > 0) {
+            int rc = msix_init(d, proxy->msix_vectors,
+                               &proxy->bar_mr[tbar], tbar,
+                               proxy->msix_table_offset,
+                               &proxy->bar_mr[pbar], pbar,
+                               proxy->msix_pba_offset,
+                               0x40, /* cap_pos for QEMU internal use */
+                               errp);
+            if (rc < 0) {
+                error_report("rpcie: MSI-X init failed for devfn 0x%02x: %d",
+                             d->devfn, rc);
+                /* Non-fatal: continue without local MSI-X */
+            }
+        } else {
+            /* BAR indices out of range — fall back to exclusive BAR */
+            int msix_bar = proxy->num_bars;
+            if (msix_bar >= RPCIE_PROXY_MAX_BARS) {
+                msix_bar = RPCIE_PROXY_MAX_BARS - 1;
+            }
+            int rc = msix_init_exclusive_bar(d, proxy->msix_vectors,
+                                             msix_bar, errp);
+            if (rc < 0) {
+                error_report("rpcie: MSI-X exclusive bar init failed: %d", rc);
+            }
+        }
+    }
+
+    /*
+     * Initialize MSI.
+     * cap_pos is set to 0x50 to avoid conflict with MSI-X at 0x40.
+     */
+    if (proxy->has_msi && proxy->msi_vectors > 0) {
+        int rc = msi_init(d, 0x50, proxy->msi_vectors,
+                          proxy->msi_64bit,
+                          proxy->msi_per_vector_mask, errp);
         if (rc < 0) {
-            /* Non-fatal — continue without MSI-X */
-            error_report("rpcie: MSI-X init failed for devfn 0x%02x",
-                         d->devfn);
+            error_report("rpcie: MSI init failed for devfn 0x%02x: %d",
+                         d->devfn, rc);
         }
     }
 }
@@ -1147,13 +1545,32 @@ static void rpcie_proxy_exit(PCIDevice *d)
 {
     RemotePcieProxy *proxy = REMOTE_PCIE_PROXY(d);
 
-    if (proxy->has_msix) {
-        msix_uninit_exclusive_bar(d);
+    /* Deassert INTx if still active */
+    if (proxy->intx_level) {
+        pci_set_irq(d, 0);
+        proxy->intx_level = 0;
     }
 
+    /* Uninitialize MSI */
+    if (proxy->has_msi && msi_present(d)) {
+        msi_uninit(d);
+    }
+
+    /* Uninitialize MSI-X */
+    if (proxy->has_msix && msix_present(d)) {
+        uint8_t tbar = proxy->msix_table_bar;
+        uint8_t pbar = proxy->msix_pba_bar;
+        if (tbar < proxy->num_bars && pbar < proxy->num_bars &&
+            proxy->bar_mr[tbar].size > 0 && proxy->bar_mr[pbar].size > 0) {
+            msix_uninit(d, &proxy->bar_mr[tbar], &proxy->bar_mr[pbar]);
+        } else {
+            msix_uninit_exclusive_bar(d);
+        }
+    }
+
+    /* Free BAR contexts */
     for (int i = 0; i < proxy->num_bars; i++) {
         if (proxy->bar_mr[i].size) {
-            /* Free the bar context */
             void *ctx = proxy->bar_mr[i].opaque;
             if (ctx) {
                 g_free(ctx);
@@ -1171,7 +1588,7 @@ static void rpcie_proxy_class_init(ObjectClass *klass, const void *data)
     k->exit         = rpcie_proxy_exit;
     k->config_read  = rpcie_proxy_config_read;
     k->config_write = rpcie_proxy_config_write;
-    k->vendor_id    = 0xFFFF; /* placeholder — real ID comes from sim */
+    k->vendor_id    = 0xFFFF; /* placeholder — real ID set from FN_ADD */
     k->device_id    = 0xFFFF;
     k->class_id     = PCI_CLASS_OTHERS;
 

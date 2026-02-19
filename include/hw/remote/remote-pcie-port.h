@@ -10,7 +10,7 @@
  * are multiplexed on a single socket (one socket = one PCIe link).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
- * Copyright 2026 Open-DPU Project
+ * Copyright 2025 Open-DPU Project
  */
 
 #ifndef HW_REMOTE_PCIE_PORT_H
@@ -20,6 +20,7 @@
 #include "hw/pci/pcie_port.h"
 #include "hw/remote/rpcie-protocol.h"
 #include "qemu/thread.h"
+#include "qemu/atomic.h"
 #include "qom/object.h"
 
 /* ------------------------------------------------------------------ */
@@ -33,7 +34,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(RemotePciePort, REMOTE_PCIE_PORT)
 #define RPCIE_MSIX_NR_VECTOR    1
 #define RPCIE_MAX_PROXIES       256     /* devfn space */
 
-/* Completion slot for blocking request/response matching. */
+/*
+ * Completion slot for blocking request/response matching.
+ *
+ * Downstream requests (QEMU → sim) use odd sequence numbers.
+ * The completion echoes the request's seq.  We map seq→slot via
+ * (seq / 2) % ring_size.  With a 256-slot ring and sequences
+ * incrementing by 2, collisions only occur with 256 outstanding
+ * requests—well beyond real-world use.
+ */
 typedef struct RpcieCompletion {
     uint32_t seq;
     bool     valid;
@@ -43,7 +52,7 @@ typedef struct RpcieCompletion {
     uint16_t extra_len;
 } RpcieCompletion;
 
-#define RPCIE_CPL_RING_SIZE  64
+#define RPCIE_CPL_RING_SIZE  256  /* must be power of 2 */
 
 struct RemotePciePort {
     /*< private >*/
@@ -58,7 +67,7 @@ struct RemotePciePort {
 
     /* Protocol */
     uint32_t     remote_caps;  /* negotiated capabilities */
-    uint32_t     next_seq;     /* next downstream seq (odd, += 2) */
+    uint32_t     next_seq;     /* atomic; odd numbers for downstream (+=2) */
 
     /* RX thread */
     QemuThread   rx_thread;
@@ -101,17 +110,40 @@ struct RemotePcieProxy {
     bool            is_vf;
     uint16_t        pf_bdf;
 
+    /* PCI identity (cached from FN_ADD for local config space) */
+    uint16_t        vendor_id;
+    uint16_t        device_id;
+    uint16_t        subsys_vendor_id;
+    uint16_t        subsys_id;
+    uint8_t         class_code[3];  /* prog_if, subclass, base_class */
+    uint8_t         revision;
+
     /* BARs */
     MemoryRegion    bar_mr[RPCIE_PROXY_MAX_BARS];
     uint64_t        bar_size[RPCIE_PROXY_MAX_BARS];
     uint8_t         bar_type[RPCIE_PROXY_MAX_BARS]; /* RPCIE_BAR_* */
+    uint8_t         bar_prefetchable[RPCIE_PROXY_MAX_BARS];
     uint8_t         num_bars;
 
-    /* MSI-X */
+    /* MSI-X (local shadow table for interrupt injection) */
     bool            has_msix;
     uint16_t        msix_vectors;
-    MemoryRegion    msix_table_mr;
-    MemoryRegion    msix_pba_mr;
+    uint8_t         msix_table_bar;
+    uint32_t        msix_table_offset;
+    uint8_t         msix_pba_bar;
+    uint32_t        msix_pba_offset;
+
+    /* MSI */
+    bool            has_msi;
+    uint8_t         msi_vectors;
+    bool            msi_64bit;
+    bool            msi_per_vector_mask;
+
+    /* FLR */
+    bool            flr_capable;
+
+    /* INTx state (for edge detection) */
+    int             intx_level;
 };
 
 /* ------------------------------------------------------------------ */
@@ -130,7 +162,7 @@ int rpcie_send_and_wait(RemotePciePort *rp, uint32_t seq,
                         uint32_t *cpl_data, uint8_t *cpl_status,
                         int timeout_ms);
 
-/* Allocate the next downstream sequence number (odd). */
+/* Allocate the next downstream sequence number (odd, thread-safe). */
 uint32_t rpcie_alloc_seq(RemotePciePort *rp);
 
 #endif /* HW_REMOTE_PCIE_PORT_H */
