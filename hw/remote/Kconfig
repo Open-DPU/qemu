@@ -6,3 +6,8 @@ config MULTIPROCESS
 config VFIO_USER_SERVER
     bool
     depends on MULTIPROCESS
+
+config REMOTE_PCIE_PORT
+    bool
+    default y
+    depends on PCI && PCI_EXPRESS

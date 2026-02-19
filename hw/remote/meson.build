@@ -12,7 +12,9 @@ remote_ss.add(when: 'CONFIG_VFIO_USER_SERVER', if_true: libvfio_user_dep)
 remote_ss.add(when: 'CONFIG_VFIO_USER_SERVER', if_true: files('vfio-user-obj.c'),
               if_false: files('vfio-user-obj-stub.c'))
 
+
 specific_ss.add(when: 'CONFIG_MULTIPROCESS', if_true: files('memory.c'))
 specific_ss.add(when: 'CONFIG_MULTIPROCESS', if_true: files('proxy-memory-listener.c'))
 
 system_ss.add_all(when: 'CONFIG_MULTIPROCESS', if_true: remote_ss)
+system_ss.add(when: 'CONFIG_REMOTE_PCIE_PORT', if_true: files('remote-pcie-port.c'))
