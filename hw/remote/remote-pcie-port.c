@@ -352,6 +352,21 @@ static void rpcie_config_write(PCIDevice *d, uint32_t address,
     RemotePciePort *rp = REMOTE_PCIE_PORT(d);
 
     /*
+     * Capture SR-IOV state BEFORE applying the config write.
+     * pci_default_write_config modifies d->config in place, so we must
+     * snapshot the old VFE/NumVFs state first to detect transitions.
+     */
+    bool old_vfe = false;
+    uint16_t old_num_vfs = 0;
+    if (rp->sriov_capable && d->exp.sriov_cap) {
+        uint16_t sriov_cap = d->exp.sriov_cap;
+        old_vfe = (pci_get_word(d->config + sriov_cap + PCI_SRIOV_CTRL)
+                   & PCI_SRIOV_CTRL_VFE) != 0;
+        old_num_vfs = old_vfe ?
+            pci_get_word(d->config + sriov_cap + PCI_SRIOV_NUM_VF) : 0;
+    }
+
+    /*
      * Apply locally so QEMU updates BAR mappings, command register,
      * and capability structures when the guest programs them.
      * As with reads, config-space writes are not forwarded to the
@@ -360,20 +375,51 @@ static void rpcie_config_write(PCIDevice *d, uint32_t address,
     pci_default_write_config(d, address, val, len);
 
     /*
-     * If SR-IOV capable, let QEMU's SR-IOV subsystem handle VF
-     * creation/destruction when guest writes VF Enable.
+     * If SR-IOV capable, check whether VF Enable state changed.
+     * Note: pci_default_write_config() already called
+     * pcie_sriov_config_write() internally, so do NOT call it again
+     * here — a double call would re-enter consume_config().
      */
     if (rp->sriov_capable) {
-        uint16_t old_num_vfs = pcie_sriov_num_vfs(d);
-        pcie_sriov_config_write(d, address, val, len);
-        uint16_t new_num_vfs = pcie_sriov_num_vfs(d);
+        uint16_t sriov_cap = d->exp.sriov_cap;
+        bool new_vfe = (pci_get_word(d->config + sriov_cap + PCI_SRIOV_CTRL)
+                        & PCI_SRIOV_CTRL_VFE) != 0;
+        uint16_t new_num_vfs = new_vfe ?
+            pci_get_word(d->config + sriov_cap + PCI_SRIOV_NUM_VF) : 0;
 
-        /* Detect VF enable state change → notify simulation */
-        if (old_num_vfs != new_num_vfs) {
+        /*
+         * Fix VF config-space identity when VFs become enabled.
+         *
+         * QEMU's pcie_sriov_pf_init() sets VF vendor/device IDs to
+         * 0xFFFF (an implementation detail — the normal kernel SR-IOV
+         * path never reads them).  However, bus rescans and direct
+         * config reads DO check vendor ID, seeing 0xFFFF as "no device".
+         *
+         * Per PCIe SR-IOV spec §3.4.1.1, VFs present the PF's Vendor ID
+         * and the VF Device ID from the SR-IOV capability.  Restore these
+         * when VFs are enabled so bus scans discover them correctly.
+         */
+        if (new_num_vfs > 0 && (!old_vfe || old_num_vfs != new_num_vfs)) {
+            uint16_t pf_vendor = pci_get_word(d->config + PCI_VENDOR_ID);
+            uint16_t vf_devid  = pci_get_word(
+                d->config + sriov_cap + PCI_SRIOV_VF_DID);
+
+            for (int i = 0; i < new_num_vfs; i++) {
+                PCIDevice *vf = d->exp.sriov_pf.vf[i];
+                pci_config_set_vendor_id(vf->config, pf_vendor);
+                pci_config_set_device_id(vf->config, vf_devid);
+            }
+        }
+
+        /*
+         * Detect VF enable state change → notify simulation.
+         * Also fix VF vendor/device IDs so bus scan finds them.
+         */
+        if (old_vfe != new_vfe || old_num_vfs != new_num_vfs) {
             rpcie_ctrl_sriov_event_t ev = {
                 .msg_type  = RPCIE_CTRL_SRIOV_EVENT,
                 .pf_index  = 0,
-                .vf_enable = (new_num_vfs > 0) ? 1 : 0,
+                .vf_enable = new_vfe ? 1 : 0,
                 .reserved  = 0,
                 .num_vfs   = new_num_vfs,
                 .reserved2 = 0,
@@ -796,8 +842,15 @@ static int rpcie_recv_initial_fn_add(RemotePciePort *rp, Error **errp)
             rp->sriov_vf_bar_type[i] = vf_bar.type;
         }
 
-        /* Initialize SR-IOV Extended Capability via QEMU's API */
-        if (!pcie_sriov_pf_init(d, 0x200,
+        /* Initialize SR-IOV Extended Capability via QEMU's API.
+         *
+         * The SR-IOV extended capability MUST be placed at the head
+         * of the extended capability chain (offset 0x100) when no
+         * other extended capabilities precede it.  QEMU's
+         * pcie_add_capability asserts that a valid chain exists if
+         * the offset is not PCI_CONFIG_SPACE_SIZE (0x100).
+         */
+        if (!pcie_sriov_pf_init(d, PCI_CONFIG_SPACE_SIZE,
                                 TYPE_REMOTE_PCIE_PORT_VF,
                                 sriov.vf_device_id,
                                 sriov.total_vfs,   /* init_vfs */
@@ -823,6 +876,23 @@ static int rpcie_recv_initial_fn_add(RemotePciePort *rp, Error **errp)
             if (sriov.supported_page_sizes) {
                 pcie_sriov_pf_add_sup_pgsize(d, sriov.supported_page_sizes);
             }
+
+            /*
+             * Set multifunction bit on the PF at init time.
+             *
+             * QEMU's pci_init_multifunction() skips SR-IOV VFs, so
+             * the PF's Header Type never gets the multifunction flag.
+             * The Linux kernel caches dev->multifunction at first
+             * discovery and never re-reads it.  If the PF is initially
+             * seen as single-function, bus rescans skip functions 1-7
+             * and VFs are never found.
+             *
+             * By setting multifunction unconditionally when SR-IOV is
+             * configured, the kernel will probe functions 1-7 during
+             * initial scan (finding nothing, since VFs start disabled)
+             * AND during later rescans after VF Enable is set.
+             */
+            d->config[PCI_HEADER_TYPE] |= PCI_HEADER_TYPE_MULTI_FUNCTION;
 
             info_report("rpcie: SR-IOV enabled, total_vfs=%d vf_dev=0x%04x",
                         sriov.total_vfs, sriov.vf_device_id);
@@ -944,6 +1014,7 @@ static void rpcie_realize(PCIDevice *d, Error **errp)
     qemu_thread_create(&rp->rx_thread, "rpcie-rx",
                        rpcie_rx_thread, rp,
                        QEMU_THREAD_JOINABLE);
+
 
     info_report("rpcie: endpoint ready");
     return;

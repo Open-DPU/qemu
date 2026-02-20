@@ -190,6 +190,7 @@ typedef struct __attribute__((packed)) {
 #define RPCIE_CTRL_FN_REMOVE       0xF6
 #define RPCIE_CTRL_SHM_SETUP       0xF7
 #define RPCIE_CTRL_SHM_ACK         0xF8
+#define RPCIE_CTRL_SRIOV_EVENT     0xF9  // QEMU → sim: VF Enable changed
 
 // Is this a control message (not a real TLP)?
 #define RPCIE_IS_CTRL(ft)    ((ft) >= 0xF0)
@@ -239,10 +240,12 @@ typedef struct __attribute__((packed)) {
     uint8_t  has_msix;       // 1 if MSI-X info follows bar descriptors
     uint8_t  has_msi;        // 1 if MSI info follows (after optional MSI-X)
     uint8_t  flr_capable;    // 1 if function supports FLR
+    uint8_t  has_sriov;      // 1 if SR-IOV info follows (PFs only)
     // Followed by:
     //   num_bars  × rpcie_bar_desc_t
-    //   if has_msix: 1 × rpcie_msix_info_t
-    //   if has_msi:  1 × rpcie_msi_info_t
+    //   if has_msix:  1 × rpcie_msix_info_t
+    //   if has_msi:   1 × rpcie_msi_info_t
+    //   if has_sriov: 1 × rpcie_sriov_info_t + num_vf_bars × rpcie_bar_desc_t
 } rpcie_ctrl_fn_add_t;
 
 // BAR descriptor (appended to FN_ADD)
@@ -275,6 +278,29 @@ typedef struct __attribute__((packed)) {
     uint8_t  per_vector_mask; // 1 if per-vector masking supported
     uint8_t  reserved;
 } rpcie_msi_info_t;
+
+// SR-IOV capability info (appended to FN_ADD if has_sriov=1, PFs only)
+// Followed by num_vf_bars × rpcie_bar_desc_t for VF BAR sizes/types.
+typedef struct __attribute__((packed)) {
+    uint16_t total_vfs;      // maximum VFs supported
+    uint16_t vf_device_id;   // PCI device ID for VFs
+    uint16_t vf_offset;      // first VF offset (BDF routing)
+    uint16_t vf_stride;      // VF stride (BDF routing)
+    uint16_t supported_page_sizes; // supported page sizes bitmap
+    uint8_t  num_vf_bars;    // number of VF BAR descriptors following
+    uint8_t  reserved;
+    // Followed by: num_vf_bars × rpcie_bar_desc_t
+} rpcie_sriov_info_t;
+
+// --- SR-IOV event (QEMU → sim): guest changed VF Enable ---
+typedef struct __attribute__((packed)) {
+    uint8_t  msg_type;       // RPCIE_CTRL_SRIOV_EVENT
+    uint8_t  pf_index;       // which PF (0 for single-PF)
+    uint8_t  vf_enable;      // 1 = VFs enabled, 0 = VFs disabled
+    uint8_t  reserved;
+    uint16_t num_vfs;        // number of VFs requested by guest
+    uint16_t reserved2;
+} rpcie_ctrl_sriov_event_t;
 
 // --- Function remove (sim → QEMU): a function was removed ---
 typedef struct __attribute__((packed)) {
