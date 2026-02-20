@@ -193,7 +193,7 @@ static uint64_t rpcie_bar_read(void *opaque, hwaddr addr, unsigned size)
     uint8_t  status = RPCIE_CPL_UR;
 
     if (rpcie_send_and_wait(rp, seq, &tlp, sizeof(tlp),
-                            &data, &status, 5000) < 0 ||
+                            &data, &status, 30000) < 0 ||
         status != RPCIE_CPL_SC) {
         return 0xFFFFFFFF;
     }
@@ -276,7 +276,7 @@ static uint64_t rpcie_vf_bar_read(void *opaque, hwaddr addr, unsigned size)
     uint8_t  status = RPCIE_CPL_UR;
 
     if (rpcie_send_and_wait(rp, seq, &tlp, sizeof(tlp),
-                            &data, &status, 5000) < 0 ||
+                            &data, &status, 30000) < 0 ||
         status != RPCIE_CPL_SC) {
         return 0xFFFFFFFF;
     }
