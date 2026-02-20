@@ -27,8 +27,10 @@
 
 #define TYPE_REMOTE_PCIE_PORT    "remote-pcie-port"
 #define TYPE_REMOTE_PCIE_PORT_VF "remote-pcie-port-vf"
+#define TYPE_REMOTE_PCIE_PORT_PF "remote-pcie-port-pf"
 OBJECT_DECLARE_SIMPLE_TYPE(RemotePciePort, REMOTE_PCIE_PORT)
 OBJECT_DECLARE_SIMPLE_TYPE(RemotePciePortVF, REMOTE_PCIE_PORT_VF)
+OBJECT_DECLARE_SIMPLE_TYPE(RemotePciePortPF, REMOTE_PCIE_PORT_PF)
 
 #define RPCIE_MAX_BARS          6
 #define RPCIE_CPL_RING_SIZE     256   /* must be power of 2 */
@@ -86,6 +88,11 @@ struct RemotePciePort {
     uint8_t      sriov_num_vf_bars;
     uint64_t     sriov_vf_bar_size[RPCIE_MAX_BARS];
     uint8_t      sriov_vf_bar_type[RPCIE_MAX_BARS];
+    uint32_t     sriov_sup_pgsize;
+
+    /* Multi-PF: companion PCI devices for functions 1-7 */
+    struct RemotePciePortPF *pf_companions[7];
+    int          num_pfs;   /* total PF count (1 = single function) */
 };
 
 /* VF companion device (auto-created by QEMU's SR-IOV subsystem) */
@@ -95,6 +102,22 @@ struct RemotePciePortVF {
     /*< public >*/
 
     MemoryRegion bar_mr[RPCIE_MAX_BARS];
+};
+
+/* PF companion device (dynamically created for multi-function endpoints) */
+struct RemotePciePortPF {
+    /*< private >*/
+    PCIDevice parent_obj;
+    /*< public >*/
+
+    MemoryRegion bar_mr[RPCIE_MAX_BARS];
+    RemotePciePort *pf0;       /* back-pointer to PF0 for socket access */
+    uint16_t     remote_bdf;   /* this companion's BDF */
+    int          pf_index;     /* function number (1-7) */
+
+    /* FN_ADD payload, stored between creation and realize */
+    uint8_t      fn_add_buf[4096];
+    uint32_t     fn_add_len;
 };
 
 /* Send a framed message (acquires send_mutex). */

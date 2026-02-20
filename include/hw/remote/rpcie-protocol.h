@@ -241,12 +241,23 @@ typedef struct __attribute__((packed)) {
     uint8_t  has_msi;        // 1 if MSI info follows (after optional MSI-X)
     uint8_t  flr_capable;    // 1 if function supports FLR
     uint8_t  has_sriov;      // 1 if SR-IOV info follows (PFs only)
+    uint8_t  num_custom_caps; // number of rpcie_custom_cap_desc_t following
     // Followed by:
     //   num_bars  × rpcie_bar_desc_t
     //   if has_msix:  1 × rpcie_msix_info_t
     //   if has_msi:   1 × rpcie_msi_info_t
     //   if has_sriov: 1 × rpcie_sriov_info_t + num_vf_bars × rpcie_bar_desc_t
+    //   num_custom_caps × rpcie_custom_cap_desc_t (each followed by data_len bytes)
 } rpcie_ctrl_fn_add_t;
+
+// Custom PCI capability descriptor (appended to FN_ADD)
+// Followed immediately by data_len bytes of capability body
+// (excluding the 2-byte PCI header: cap_id and next pointer).
+typedef struct __attribute__((packed)) {
+    uint8_t  cap_id;         // PCI capability ID (e.g. 0x09 for vendor-specific)
+    uint8_t  reserved;
+    uint16_t data_len;       // length of body data in bytes
+} rpcie_custom_cap_desc_t;
 
 // BAR descriptor (appended to FN_ADD)
 typedef struct __attribute__((packed)) {
