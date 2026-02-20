@@ -438,13 +438,42 @@ static void rpcie_config_write(PCIDevice *d, uint32_t address,
 
 /*
  * Resolve a BDF to the correct PCIDevice* for DMA and interrupt dispatch.
+ *
+ * The protocol BDF encodes bus:dev:fn.  PFs are at fn 0-7 (same dev as
+ * PF0).  VFs have devfn = pf_fn + vf_offset + vf_idx * vf_stride, which
+ * may exceed fn 7 and spill into the dev field.
  */
 static PCIDevice *rpcie_resolve_device(RemotePciePort *rp, uint16_t bdf)
 {
+    /* PF0 — fast path */
     if (bdf == rp->remote_bdf) return PCI_DEVICE(rp);
-    uint8_t fn = RPCIE_BDF_FN(bdf);
-    if (fn > 0 && fn <= 7 && rp->pf_companions[fn - 1])
-        return PCI_DEVICE(rp->pf_companions[fn - 1]);
+
+    /* PF companions — compare by stored remote_bdf */
+    for (int i = 0; i < 7; i++) {
+        if (rp->pf_companions[i] &&
+            rp->pf_companions[i]->remote_bdf == bdf) {
+            return PCI_DEVICE(rp->pf_companions[i]);
+        }
+    }
+
+    /* SR-IOV VFs — compute VF index from BDF arithmetic */
+    if (rp->sriov_capable && rp->sriov_vf_stride > 0) {
+        PCIDevice *d = PCI_DEVICE(rp);
+        /* Extract 8-bit devfn from protocol BDF (bus=0) */
+        int pf0_devfn = (RPCIE_BDF_DEV(rp->remote_bdf) << 3) |
+                         RPCIE_BDF_FN(rp->remote_bdf);
+        int target_devfn = (RPCIE_BDF_DEV(bdf) << 3) | RPCIE_BDF_FN(bdf);
+        int delta = target_devfn - pf0_devfn - rp->sriov_vf_offset;
+        if (delta >= 0 && (delta % rp->sriov_vf_stride) == 0) {
+            int vf_idx = delta / rp->sriov_vf_stride;
+            uint16_t num_vfs = pcie_sriov_num_vfs(d);
+            if (vf_idx >= 0 && vf_idx < num_vfs &&
+                d->exp.sriov_pf.vf[vf_idx]) {
+                return d->exp.sriov_pf.vf[vf_idx];
+            }
+        }
+    }
+
     return PCI_DEVICE(rp);
 }
 
@@ -563,24 +592,24 @@ static void *rpcie_rx_thread(void *opaque)
     rpcie_frame_hdr_t hdr;
     uint8_t buf[RPCIE_MAX_PAYLOAD + 256];
 
-    while (rp->rx_running) {
+    while (qatomic_read(&rp->rx_running)) {
         struct pollfd pfd = { .fd = rp->conn_fd, .events = POLLIN };
         if (poll(&pfd, 1, 100) <= 0) continue;
 
         if (rpcie_recv_full(rp->conn_fd, &hdr, sizeof(hdr)) < 0) {
             error_report("rpcie: connection closed");
-            rp->rx_running = false;
+            qatomic_set(&rp->rx_running, false);
             break;
         }
         if (hdr.magic != RPCIE_MAGIC || hdr.length > sizeof(buf)) {
             error_report("rpcie: bad frame (magic=0x%x len=%u)",
                          hdr.magic, hdr.length);
-            rp->rx_running = false;
+            qatomic_set(&rp->rx_running, false);
             break;
         }
         if (hdr.length > 0 &&
             rpcie_recv_full(rp->conn_fd, buf, hdr.length) < 0) {
-            rp->rx_running = false;
+            qatomic_set(&rp->rx_running, false);
             break;
         }
         if (hdr.length == 0) continue;
@@ -591,7 +620,7 @@ static void *rpcie_rx_thread(void *opaque)
             switch (ft) {
             case RPCIE_CTRL_LINK_DOWN:
                 info_report("rpcie: simulation sent LINK_DOWN");
-                rp->rx_running = false;
+                qatomic_set(&rp->rx_running, false);
                 break;
             case RPCIE_CTRL_RESET:
                 info_report("rpcie: reset from simulation");
@@ -1218,7 +1247,7 @@ static void rpcie_realize(PCIDevice *d, Error **errp)
     }
 
     /* Start RX thread */
-    rp->rx_running = true;
+    qatomic_set(&rp->rx_running, true);
     qemu_thread_create(&rp->rx_thread, "rpcie-rx",
                        rpcie_rx_thread, rp,
                        QEMU_THREAD_JOINABLE);
@@ -1234,7 +1263,7 @@ static void rpcie_exit(PCIDevice *d)
 {
     RemotePciePort *rp = REMOTE_PCIE_PORT(d);
 
-    rp->rx_running = false;
+    qatomic_set(&rp->rx_running, false);
     if (rp->conn_fd >= 0) {
         rpcie_ctrl_link_t link = { .msg_type = RPCIE_CTRL_LINK_DOWN };
         rpcie_send_msg(rp, rpcie_alloc_seq(rp), &link, sizeof(link));
@@ -1291,7 +1320,7 @@ static void rpcie_reset_hold(Object *obj, ResetType type)
         pcie_sriov_pf_reset(PCI_DEVICE(rp));
     }
 
-    if (rp->conn_fd >= 0 && rp->rx_running) {
+    if (rp->conn_fd >= 0 && qatomic_read(&rp->rx_running)) {
         rpcie_ctrl_reset_t msg = {
             .msg_type   = RPCIE_CTRL_RESET,
             .reset_type = RPCIE_RESET_HOT,
