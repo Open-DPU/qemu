@@ -351,6 +351,7 @@ typedef struct __attribute__((packed)) {
     uint16_t region_id;      // 0 = guest RAM, may extend for other regions
     uint64_t offset;         // offset within the fd
     uint64_t size;           // size of the mapping in bytes
+    uint64_t below_4g_size;  // RAM below PCI hole (x86); 0 = no hole
 } rpcie_ctrl_shm_setup_t;
 
 // --- Shared memory acknowledgement (sim → QEMU) ---

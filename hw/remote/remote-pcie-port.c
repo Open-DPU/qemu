@@ -39,6 +39,9 @@
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "system/dma.h"
+#include "hw/core/boards.h"
+#include "system/memory.h"
+#include "hw/i386/x86.h"
 
 #include "hw/remote/remote-pcie-port.h"
 
@@ -108,6 +111,39 @@ int rpcie_send_msg(RemotePciePort *rp, uint32_t seq,
 uint32_t rpcie_alloc_seq(RemotePciePort *rp)
 {
     return qatomic_fetch_add(&rp->next_seq, 2);
+}
+
+/*
+ * Send a file descriptor via SCM_RIGHTS.
+ * The receiver (C bridge) does a separate recvmsg() with 1 dummy byte.
+ */
+static int rpcie_send_fd(int sock_fd, int fd)
+{
+    struct msghdr msg = {0};
+    struct iovec iov;
+    char dummy = 0;
+
+    iov.iov_base = &dummy;
+    iov.iov_len  = 1;
+    msg.msg_iov    = &iov;
+    msg.msg_iovlen = 1;
+
+    union {
+        struct cmsghdr align;
+        char buf[CMSG_SPACE(sizeof(int))];
+    } cmsg_buf;
+
+    msg.msg_control    = cmsg_buf.buf;
+    msg.msg_controllen = sizeof(cmsg_buf.buf);
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type  = SCM_RIGHTS;
+    cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+
+    ssize_t n = sendmsg(sock_fd, &msg, MSG_NOSIGNAL);
+    return (n >= 0) ? 0 : -1;
 }
 
 /* ================================================================== */
@@ -374,6 +410,34 @@ static void rpcie_config_write(PCIDevice *d, uint32_t address,
      * simulation because it has no config-space TLP path.
      */
     pci_default_write_config(d, address, val, len);
+
+    /*
+     * FLR (Function Level Reset) interception.
+     * pcie_cap_flr_init() made BCR_FLR writable.  After
+     * pci_default_write_config() applies the write, check whether the
+     * guest set the FLR initiate bit.  If so, forward to the simulation
+     * and clear the bit.  We intentionally do NOT call pci_device_reset()
+     * here because the simulation owns all device state — it will apply
+     * the reset on its side and we'll see the effects through the normal
+     * data path.
+     */
+    if (d->exp.exp_cap) {
+        uint8_t *devctl = d->config + d->exp.exp_cap + PCI_EXP_DEVCTL;
+        if (pci_get_word(devctl) & PCI_EXP_DEVCTL_BCR_FLR) {
+            pci_word_test_and_clear_mask(devctl, PCI_EXP_DEVCTL_BCR_FLR);
+
+            if (rp->conn_fd >= 0 && qatomic_read(&rp->rx_running)) {
+                rpcie_ctrl_reset_t msg = {
+                    .msg_type   = RPCIE_CTRL_RESET,
+                    .reset_type = RPCIE_RESET_FLR,
+                    .target_bdf = rp->remote_bdf,
+                };
+                rpcie_send_msg(rp, rpcie_alloc_seq(rp), &msg, sizeof(msg));
+                info_report("rpcie: FLR initiated for BDF 0x%04x",
+                            rp->remote_bdf);
+            }
+        }
+    }
 
     /*
      * If SR-IOV capable, check whether VF Enable state changed.
@@ -806,6 +870,13 @@ static int rpcie_apply_fn_add(PCIDevice *d, RemotePciePort *rp,
     if (pcie_endpoint_cap_init(d, 0) < 0) {
         error_setg(errp, "rpcie: failed to init PCIe endpoint cap");
         return -1;
+    }
+
+    /* ---- FLR (Function Level Reset) ---- */
+    if (fn.flr_capable) {
+        pcie_cap_flr_init(d);
+        info_report("rpcie: FLR capability enabled for BDF 0x%04x",
+                    remote_bdf);
     }
 
     /* ---- Parse MSI-X info ---- */
@@ -1321,6 +1392,86 @@ static void rpcie_realize(PCIDevice *d, Error **errp)
     /* Wait for FN_ADD(s) — configures identity + BARs for all PFs */
     if (rpcie_recv_fn_adds(rp, errp) < 0) {
         goto fail;
+    }
+
+    /*
+     * Set up shared memory (SHM) for zero-copy DMA.
+     *
+     * If both sides negotiated RPCIE_CAP_SHM during the handshake, send
+     * the guest RAM memfd to the simulation so it can mmap it directly.
+     * This eliminates the TLP round-trip for every DMA read/write,
+     * dramatically improving DMA-heavy workloads (Virtio, NIC, etc.).
+     *
+     * Protocol: send framed SHM_SETUP message, then pass the RAM fd
+     * via a separate sendmsg() with SCM_RIGHTS, then wait for SHM_ACK.
+     */
+    if (rp->remote_caps & RPCIE_CAP_SHM) {
+        MachineState *ms = MACHINE(qdev_get_machine());
+        MemoryRegion *ram = ms->ram;
+        int ram_fd = memory_region_get_fd(ram);
+        uint64_t ram_size = memory_region_size(ram);
+
+        if (ram_fd >= 0) {
+            /* Determine x86 below-4G RAM size for PCI hole translation */
+            uint64_t below_4g = 0;
+            if (object_dynamic_cast(OBJECT(ms), TYPE_X86_MACHINE)) {
+                X86MachineState *x86ms = X86_MACHINE(ms);
+                below_4g = x86ms->below_4g_mem_size;
+            }
+
+            rpcie_ctrl_shm_setup_t setup = {
+                .msg_type      = RPCIE_CTRL_SHM_SETUP,
+                .reserved      = 0,
+                .region_id     = 0,    /* 0 = main guest RAM */
+                .offset        = 0,
+                .size          = ram_size,
+                .below_4g_size = below_4g,
+            };
+
+            /* Send the SHM_SETUP framed message */
+            if (rpcie_send_msg(rp, rpcie_alloc_seq(rp),
+                               &setup, sizeof(setup)) < 0) {
+                info_report("rpcie: SHM_SETUP send failed, "
+                            "falling back to TLP DMA");
+            } else {
+                /* Send the fd via SCM_RIGHTS (separate sendmsg) */
+                qemu_mutex_lock(&rp->send_mutex);
+                int fd_rc = rpcie_send_fd(rp->conn_fd, ram_fd);
+                qemu_mutex_unlock(&rp->send_mutex);
+
+                if (fd_rc < 0) {
+                    info_report("rpcie: SHM fd send failed, "
+                                "falling back to TLP DMA");
+                } else {
+                    /* Wait for SHM_ACK (comes as a framed control message) */
+                    uint8_t ack_buf[64];
+                    uint32_t ack_len;
+                    int ack_type = rpcie_recv_one_msg(rp->conn_fd, ack_buf,
+                                                     sizeof(ack_buf),
+                                                     &ack_len, 5000);
+                    if (ack_type == RPCIE_CTRL_SHM_ACK &&
+                        ack_len >= sizeof(rpcie_ctrl_shm_ack_t)) {
+                        rpcie_ctrl_shm_ack_t ack;
+                        memcpy(&ack, ack_buf, sizeof(ack));
+                        if (ack.status == 0) {
+                            info_report("rpcie: SHM enabled, %lu MB "
+                                        "guest RAM mapped for zero-copy DMA",
+                                        (unsigned long)(ram_size / (1024*1024)));
+                        } else {
+                            info_report("rpcie: SHM_ACK error %d, "
+                                        "falling back to TLP DMA", ack.status);
+                        }
+                    } else {
+                        info_report("rpcie: SHM_ACK timeout or unexpected "
+                                    "msg (type=0x%02x), falling back to "
+                                    "TLP DMA", ack_type);
+                    }
+                }
+            }
+        } else {
+            info_report("rpcie: RAM not backed by fd, "
+                        "SHM disabled (TLP DMA only)");
+        }
     }
 
     /* Start RX thread */
