@@ -242,12 +242,14 @@ typedef struct __attribute__((packed)) {
     uint8_t  flr_capable;    // 1 if function supports FLR
     uint8_t  has_sriov;      // 1 if SR-IOV info follows (PFs only)
     uint8_t  num_custom_caps; // number of rpcie_custom_cap_desc_t following
+    uint8_t  num_custom_ext_caps; // number of rpcie_custom_ext_cap_desc_t following
     // Followed by:
     //   num_bars  × rpcie_bar_desc_t
     //   if has_msix:  1 × rpcie_msix_info_t
     //   if has_msi:   1 × rpcie_msi_info_t
     //   if has_sriov: 1 × rpcie_sriov_info_t + num_vf_bars × rpcie_bar_desc_t
     //   num_custom_caps × rpcie_custom_cap_desc_t (each followed by data_len bytes)
+    //   num_custom_ext_caps × rpcie_custom_ext_cap_desc_t (each followed by data_len bytes)
 } rpcie_ctrl_fn_add_t;
 
 // Custom PCI capability descriptor (appended to FN_ADD)
@@ -258,6 +260,17 @@ typedef struct __attribute__((packed)) {
     uint8_t  reserved;
     uint16_t data_len;       // length of body data in bytes
 } rpcie_custom_cap_desc_t;
+
+// Custom PCIe extended capability descriptor (appended to FN_ADD)
+// Followed immediately by data_len bytes of extended capability body
+// (excluding the 4-byte ext cap header: cap_id, version, next pointer).
+typedef struct __attribute__((packed)) {
+    uint16_t cap_id;         // Extended capability ID (e.g. 0x0001 for AER)
+    uint8_t  cap_version;    // Capability version (4-bit)
+    uint8_t  reserved;
+    uint16_t data_len;       // length of body data in bytes
+    uint16_t reserved2;
+} rpcie_custom_ext_cap_desc_t;
 
 // BAR descriptor (appended to FN_ADD)
 typedef struct __attribute__((packed)) {

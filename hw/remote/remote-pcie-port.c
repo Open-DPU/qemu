@@ -910,10 +910,87 @@ static int rpcie_apply_fn_add(PCIDevice *d, RemotePciePort *rp,
             memcpy(d->config + cap_pos + 2, p, desc.data_len);
             info_report("rpcie: added custom cap 0x%02x at 0x%x (%d bytes)",
                         desc.cap_id, cap_pos, desc.data_len);
+
+            /* PM capability (ID 0x01): set PMCSR writable mask */
+            if (desc.cap_id == 0x01 && desc.data_len >= 4) {
+                /* PMCSR is at cap_pos + 4 (after 2B header + 2B PMC) */
+                /* Bits [1:0] = PowerState (RW) */
+                /* Bit [8] = PME_En (RW) */
+                pci_set_word(d->wmask + cap_pos + 4, 0x0103);
+                /* Bit [15] = PME_Status (W1C) */
+                pci_set_word(d->w1cmask + cap_pos + 4, 0x8000);
+                info_report("rpcie: PM cap PMCSR writable mask set at 0x%x",
+                            cap_pos + 4);
+            }
         }
 
         p += desc.data_len;
         remaining -= desc.data_len;
+    }
+
+    /* ---- Parse custom PCIe extended capabilities ---- */
+    {
+        /* Allocate ext caps sequentially starting at 0x100 */
+        uint16_t ext_cap_offset = PCI_CONFIG_SPACE_SIZE; /* 0x100 */
+
+        for (int i = 0; i < fn.num_custom_ext_caps
+                 && remaining >= sizeof(rpcie_custom_ext_cap_desc_t); i++) {
+            rpcie_custom_ext_cap_desc_t desc;
+            memcpy(&desc, p, sizeof(desc));
+            p += sizeof(rpcie_custom_ext_cap_desc_t);
+            remaining -= sizeof(rpcie_custom_ext_cap_desc_t);
+
+            if (desc.data_len > remaining) {
+                info_report("rpcie: custom ext cap %d truncated", i);
+                break;
+            }
+
+            /* Extended cap header is 4 bytes, body follows */
+            int total_len = 4 + desc.data_len;
+            int aligned = (total_len + 3) & ~3;
+            if (aligned < 8) aligned = 8;  /* QEMU requires size >= 8 */
+
+            if (ext_cap_offset + aligned > PCIE_CONFIG_SPACE_SIZE) {
+                info_report("rpcie: ext cap %d (0x%04x) doesn't fit at 0x%x",
+                            i, desc.cap_id, ext_cap_offset);
+                p += desc.data_len;
+                remaining -= desc.data_len;
+                continue;
+            }
+
+            pcie_add_capability(d, desc.cap_id, desc.cap_version,
+                                ext_cap_offset, aligned);
+            /* Copy body data after the 4-byte ext cap header */
+            if (desc.data_len > 0) {
+                memcpy(d->config + ext_cap_offset + 4, p, desc.data_len);
+            }
+
+            info_report("rpcie: added ext cap 0x%04x v%d at 0x%x (%d bytes)",
+                        desc.cap_id, desc.cap_version, ext_cap_offset,
+                        desc.data_len);
+
+            /* AER (ext cap ID 0x0001): set writable/W1C masks */
+            if (desc.cap_id == 0x0001 && desc.data_len >= 20) {
+                uint16_t o = ext_cap_offset;
+                /* Uncorrectable Error Status (offset +0x04): W1C */
+                pci_set_long(d->w1cmask + o + 0x04, 0xFFFFFFFF);
+                /* Uncorrectable Error Mask (offset +0x08): RW */
+                pci_set_long(d->wmask + o + 0x08, 0xFFFFFFFF);
+                /* Uncorrectable Error Severity (offset +0x0C): RW */
+                pci_set_long(d->wmask + o + 0x0C, 0xFFFFFFFF);
+                /* Correctable Error Status (offset +0x10): W1C */
+                pci_set_long(d->w1cmask + o + 0x10, 0xFFFFFFFF);
+                if (desc.data_len >= 24) {
+                    /* Correctable Error Mask (offset +0x14): RW */
+                    pci_set_long(d->wmask + o + 0x14, 0xFFFFFFFF);
+                }
+                info_report("rpcie: AER ext cap masks set at 0x%x", o);
+            }
+
+            ext_cap_offset += aligned;
+            p += desc.data_len;
+            remaining -= desc.data_len;
+        }
     }
 
     info_report("rpcie: fn %02x:%02x.%x device %04x:%04x, %d BARs",
