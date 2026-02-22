@@ -1144,6 +1144,101 @@ static int rpcie_recv_one_msg(int fd, uint8_t *buf, uint32_t bufsize,
  * Finalize SR-IOV after all PF companions have been created.
  * Adjusts vf_offset to skip past PF function slots, then creates VFs.
  */
+
+/*
+ * Find the first free offset in the PCIe extended capability space
+ * (0x100..0xFFF) for a device, by walking the existing ext-cap chain.
+ * Returns the offset suitable for pcie_add_capability(), or 0 if no
+ * room for `needed` bytes.
+ */
+static uint16_t rpcie_find_free_ext_cap_offset(PCIDevice *dev, uint16_t needed)
+{
+    uint16_t pos = PCI_CONFIG_SPACE_SIZE; /* 0x100 */
+
+    while (pos >= PCI_CONFIG_SPACE_SIZE &&
+           pos + needed <= PCIE_CONFIG_SPACE_SIZE) {
+        uint32_t header = pci_get_long(dev->config + pos);
+        if (header == 0) {
+            return pos;  /* empty slot */
+        }
+        uint16_t next = PCI_EXT_CAP_NEXT(header);
+        if (next == 0) {
+            /* Last cap in chain — skip past it using QEMU's internal
+             * tracking.  pcie_find_capability returns the offset if it
+             * exists, and QEMU always chains caps via next pointers.
+             * Since there's no next pointer, we need to estimate the
+             * size of this last capability. */
+            uint16_t cap_id = PCI_EXT_CAP_ID(header);
+            uint16_t cap_size;
+            switch (cap_id) {
+            case PCI_EXT_CAP_ID_ERR:   cap_size = PCI_ERR_SIZEOF;          break;
+            case PCI_EXT_CAP_ID_SRIOV: cap_size = PCI_EXT_CAP_SRIOV_SIZEOF; break;
+            case PCI_EXT_CAP_ID_ARI:   cap_size = PCI_ARI_SIZEOF;          break;
+            default:                   cap_size = 8; /* QEMU minimum */    break;
+            }
+            uint16_t candidate = (pos + cap_size + 3) & ~3; /* 4-byte align */
+            return (candidate + needed <= PCIE_CONFIG_SPACE_SIZE)
+                   ? candidate : 0;
+        }
+        pos = next;
+    }
+    return 0;  /* no room */
+}
+
+/*
+ * Common SR-IOV PF initialisation for both PF0 and companion PFs.
+ * Places the SR-IOV extended capability after any existing ext caps.
+ * Returns true on success.
+ */
+static bool rpcie_init_sriov_on_pf(PCIDevice *d,
+                                   uint16_t vf_device_id,
+                                   uint16_t total_vfs,
+                                   uint16_t vf_offset,
+                                   uint16_t vf_stride,
+                                   uint8_t  num_vf_bars,
+                                   const uint64_t *vf_bar_size,
+                                   const uint8_t  *vf_bar_type,
+                                   uint32_t sup_pgsize)
+{
+    uint16_t sriov_off = rpcie_find_free_ext_cap_offset(
+        d, PCI_EXT_CAP_SRIOV_SIZEOF);
+    if (sriov_off == 0) {
+        info_report("rpcie: no room for SR-IOV ext cap on devfn %d",
+                    d->devfn);
+        return false;
+    }
+
+    if (!pcie_sriov_pf_init(d, sriov_off,
+                            TYPE_REMOTE_PCIE_PORT_VF,
+                            vf_device_id,
+                            total_vfs, total_vfs,
+                            vf_offset, vf_stride,
+                            NULL)) {
+        return false;
+    }
+
+    for (int i = 0; i < num_vf_bars && i < RPCIE_MAX_BARS; i++) {
+        if (vf_bar_size[i] == 0) continue;
+        int pci_type = PCI_BASE_ADDRESS_SPACE_MEMORY;
+        if (vf_bar_type[i] == RPCIE_BAR_MEM64)
+            pci_type |= PCI_BASE_ADDRESS_MEM_TYPE_64;
+        pcie_sriov_pf_init_vf_bar(d, i, pci_type, vf_bar_size[i]);
+    }
+
+    if (sup_pgsize)
+        pcie_sriov_pf_add_sup_pgsize(d, sup_pgsize);
+
+    d->config[PCI_HEADER_TYPE] |= PCI_HEADER_TYPE_MULTI_FUNCTION;
+
+    /* Set ARI Capable Hierarchy (bit 1) in SR-IOV Capabilities.
+     * This tells Linux the device supports ARI-based VF addressing,
+     * enabling VFs at devfn > 7. */
+    pci_set_long(d->config + d->exp.sriov_cap + PCI_SRIOV_CAP,
+                 pci_get_long(d->config + d->exp.sriov_cap
+                              + PCI_SRIOV_CAP) | 0x02);
+    return true;
+}
+
 static void rpcie_finalize_sriov(RemotePciePort *rp)
 {
     PCIDevice *d = PCI_DEVICE(rp);
@@ -1158,13 +1253,23 @@ static void rpcie_finalize_sriov(RemotePciePort *rp)
     uint16_t vf_stride = rp->sriov_vf_stride;
 
     if (rp->num_pfs > 1) {
+        /* With multiple PFs, stride must equal num_pfs so that each
+         * PF's VFs interleave: PF0 gets devfn 4,8,12,16; PF1 gets
+         * 5,9,13,17; etc. */
+        if (vf_stride != rp->num_pfs) {
+            info_report("rpcie: adjusted VF stride %d -> %d for multi-PF interleave",
+                        vf_stride, rp->num_pfs);
+            vf_stride = rp->num_pfs;
+            rp->sriov_vf_stride = vf_stride;
+        }
+
         uint8_t pf0_fn = PCI_FUNC(d->devfn);
         uint16_t first_vf_fn = pf0_fn + vf_offset;
 
         /* Check if any VF would land on a PF companion function */
         for (int i = 0; i < rp->sriov_total_vfs; i++) {
             uint8_t vf_fn = (first_vf_fn + i * vf_stride) & 0x7;
-            for (int pf = 0; pf < 7; pf++) {
+            for (int pf = 0; pf < rp->num_pfs - 1 && pf < 7; pf++) {
                 if (rp->pf_companions[pf] &&
                     PCI_FUNC(PCI_DEVICE(rp->pf_companions[pf])->devfn) == vf_fn) {
                     /* Collision detected — bump vf_offset past all PFs */
@@ -1176,49 +1281,19 @@ static void rpcie_finalize_sriov(RemotePciePort *rp)
                 }
             }
         }
-
-        /* With multiple PFs, stride must equal num_pfs so that each
-         * PF's VFs interleave: PF0 gets devfn 4,8,12,16; PF1 gets
-         * 5,9,13,17; etc. */
-        if (vf_stride != rp->num_pfs) {
-            info_report("rpcie: adjusted VF stride %d -> %d for multi-PF interleave",
-                        vf_stride, rp->num_pfs);
-            vf_stride = rp->num_pfs;
-            rp->sriov_vf_stride = vf_stride;
-        }
     }
 offset_fixed:
 
-    if (!pcie_sriov_pf_init(d, PCI_CONFIG_SPACE_SIZE,
-                            TYPE_REMOTE_PCIE_PORT_VF,
-                            rp->sriov_vf_device_id,
-                            rp->sriov_total_vfs, rp->sriov_total_vfs,
-                            vf_offset, vf_stride,
-                            NULL)) {
-        info_report("rpcie: pcie_sriov_pf_init failed (non-fatal)");
+    if (!rpcie_init_sriov_on_pf(d, rp->sriov_vf_device_id,
+                                rp->sriov_total_vfs,
+                                vf_offset, vf_stride,
+                                rp->sriov_num_vf_bars,
+                                rp->sriov_vf_bar_size,
+                                rp->sriov_vf_bar_type,
+                                rp->sriov_sup_pgsize)) {
+        info_report("rpcie: SR-IOV init failed for PF0 (non-fatal)");
         rp->sriov_capable = false;
     } else {
-        for (int i = 0; i < rp->sriov_num_vf_bars && i < RPCIE_MAX_BARS; i++) {
-            if (rp->sriov_vf_bar_size[i] == 0) continue;
-            int pci_type = PCI_BASE_ADDRESS_SPACE_MEMORY;
-            if (rp->sriov_vf_bar_type[i] == RPCIE_BAR_MEM64)
-                pci_type |= PCI_BASE_ADDRESS_MEM_TYPE_64;
-            pcie_sriov_pf_init_vf_bar(d, i, pci_type,
-                                      rp->sriov_vf_bar_size[i]);
-        }
-        if (rp->sriov_sup_pgsize)
-            pcie_sriov_pf_add_sup_pgsize(d, rp->sriov_sup_pgsize);
-        d->config[PCI_HEADER_TYPE] |= PCI_HEADER_TYPE_MULTI_FUNCTION;
-
-        /* Set ARI Capable Hierarchy (bit 1) in SR-IOV Capabilities.
-         * This tells Linux the device supports ARI-based VF addressing,
-         * enabling VFs at devfn > 7. */
-        pci_set_long(d->config + PCI_CONFIG_SPACE_SIZE + PCI_SRIOV_CAP,
-                     pci_get_long(d->config + PCI_CONFIG_SPACE_SIZE + PCI_SRIOV_CAP) | 0x02);
-
-        /* ARI ext cap chain is built by rpcie_rebuild_ari_chain()
-         * after all PFs and VFs are created. */
-
         info_report("rpcie: SR-IOV enabled, total_vfs=%d vf_dev=0x%04x offset=%d stride=%d",
                     rp->sriov_total_vfs, rp->sriov_vf_device_id,
                     vf_offset, vf_stride);
@@ -1263,44 +1338,9 @@ static void rpcie_rebuild_ari_chain(RemotePciePort *rp)
         /* Add ARI cap if not already present */
         uint16_t ari_off = pcie_find_capability(dev, PCI_EXT_CAP_ID_ARI);
         if (!ari_off) {
-            /* Find free offset: walk the existing ext-cap chain to find
-             * the end, so we never overwrite RTL-defined capabilities
-             * (AER, power management, etc.) at 0x100+. */
-            uint16_t offset = PCI_CONFIG_SPACE_SIZE; /* 0x100 — fallback */
-            uint16_t pos = PCI_CONFIG_SPACE_SIZE;
-            while (pos >= PCI_CONFIG_SPACE_SIZE &&
-                   pos < PCIE_CONFIG_SPACE_SIZE - PCI_ARI_SIZEOF) {
-                uint32_t header = pci_get_long(dev->config + pos);
-                if (header == 0) {
-                    /* Empty slot — place ARI here */
-                    offset = pos;
-                    break;
-                }
-                /* This slot is occupied.  Compute its size so we can
-                 * skip past it.  QEMU tracks cap sizes internally via
-                 * pcie_add_capability, but the easiest portable approach
-                 * is to advance to the next-pointer from the header. */
-                uint16_t next = PCI_EXT_CAP_NEXT(header);
-                if (next == 0) {
-                    /* Last cap in chain — figure out size by looking at
-                     * what QEMU registered.  Use sriov_cap size if this
-                     * is the SR-IOV cap, otherwise default to 8 (the
-                     * minimum QEMU ext cap size). */
-                    uint16_t cap_id = PCI_EXT_CAP_ID(header);
-                    uint16_t cap_size = 8; /* QEMU minimum */
-                    if (cap_id == PCI_EXT_CAP_ID_SRIOV)
-                        cap_size = PCI_EXT_CAP_SRIOV_SIZEOF;
-                    else if (cap_id == PCI_EXT_CAP_ID_ERR)
-                        cap_size = PCI_ERR_SIZEOF; /* 0x48 */
-                    else if (cap_id == PCI_EXT_CAP_ID_ARI)
-                        cap_size = PCI_ARI_SIZEOF;
-                    offset = (pos + cap_size + 3) & ~3; /* 4-byte align */
-                    break;
-                }
-                pos = next;
-            }
-
-            if (offset + PCI_ARI_SIZEOF > PCIE_CONFIG_SPACE_SIZE) {
+            uint16_t offset = rpcie_find_free_ext_cap_offset(
+                dev, PCI_ARI_SIZEOF);
+            if (offset == 0) {
                 info_report("rpcie: no room for ARI cap on devfn %d",
                             active[i]);
                 continue;
@@ -1803,37 +1843,17 @@ static void rpcie_pf_realize(PCIDevice *d, Error **errp)
                     pf->pf_index, vf_offset, vf_stride,
                     pf_fn + vf_offset);
 
-        if (!pcie_sriov_pf_init(d, PCI_CONFIG_SPACE_SIZE,
-                                TYPE_REMOTE_PCIE_PORT_VF,
-                                pf->sriov_vf_device_id,
-                                pf->sriov_total_vfs, pf->sriov_total_vfs,
-                                vf_offset, pf->sriov_vf_stride,
-                                NULL)) {
-            info_report("rpcie: pcie_sriov_pf_init failed for PF%d "
-                        "(non-fatal)", pf->pf_index);
+        if (!rpcie_init_sriov_on_pf(d, pf->sriov_vf_device_id,
+                                    pf->sriov_total_vfs,
+                                    vf_offset, pf->sriov_vf_stride,
+                                    pf->sriov_num_vf_bars,
+                                    pf->sriov_vf_bar_size,
+                                    pf->sriov_vf_bar_type,
+                                    pf->sriov_sup_pgsize)) {
+            info_report("rpcie: SR-IOV init failed for PF%d (non-fatal)",
+                        pf->pf_index);
             pf->sriov_capable = false;
         } else {
-            for (int i = 0; i < pf->sriov_num_vf_bars &&
-                     i < RPCIE_MAX_BARS; i++) {
-                if (pf->sriov_vf_bar_size[i] == 0) continue;
-                int pci_type = PCI_BASE_ADDRESS_SPACE_MEMORY;
-                if (pf->sriov_vf_bar_type[i] == RPCIE_BAR_MEM64)
-                    pci_type |= PCI_BASE_ADDRESS_MEM_TYPE_64;
-                pcie_sriov_pf_init_vf_bar(d, i, pci_type,
-                                          pf->sriov_vf_bar_size[i]);
-            }
-            if (pf->sriov_sup_pgsize)
-                pcie_sriov_pf_add_sup_pgsize(d, pf->sriov_sup_pgsize);
-
-            /* Set ARI Capable Hierarchy (bit 1) in SR-IOV Capabilities.
-             * This tells Linux the device supports ARI-based VF addressing,
-             * enabling VFs at devfn > 7. */
-            pci_set_long(d->config + PCI_CONFIG_SPACE_SIZE + PCI_SRIOV_CAP,
-                         pci_get_long(d->config + PCI_CONFIG_SPACE_SIZE + PCI_SRIOV_CAP) | 0x02);
-
-            /* ARI ext cap chain is built by rpcie_rebuild_ari_chain()
-             * after all PFs and VFs are created. */
-
             info_report("rpcie: SR-IOV enabled on PF%d, total_vfs=%d "
                         "vf_dev=0x%04x offset=%d stride=%d",
                         pf->pf_index, pf->sriov_total_vfs,
