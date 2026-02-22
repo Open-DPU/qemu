@@ -102,6 +102,12 @@ struct RemotePciePortVF {
     /*< public >*/
 
     MemoryRegion bar_mr[RPCIE_MAX_BARS];
+
+    /* Populated at realize time — avoids PF type checks in BAR hot path */
+    RemotePciePort *rp;             /* PF0 for socket access */
+    uint16_t      pf_remote_bdf;    /* parent PF's remote BDF */
+    uint16_t      pf_vf_offset;     /* SR-IOV VF offset from parent PF */
+    uint16_t      pf_vf_stride;     /* SR-IOV VF stride from parent PF */
 };
 
 /* PF companion device (dynamically created for multi-function endpoints) */
@@ -118,6 +124,17 @@ struct RemotePciePortPF {
     /* FN_ADD payload, stored between creation and realize */
     uint8_t      fn_add_buf[4096];
     uint32_t     fn_add_len;
+
+    /* SR-IOV state (same layout as RemotePciePort's SR-IOV fields) */
+    bool         sriov_capable;
+    uint16_t     sriov_total_vfs;
+    uint16_t     sriov_vf_device_id;
+    uint16_t     sriov_vf_offset;
+    uint16_t     sriov_vf_stride;
+    uint8_t      sriov_num_vf_bars;
+    uint64_t     sriov_vf_bar_size[RPCIE_MAX_BARS];
+    uint8_t      sriov_vf_bar_type[RPCIE_MAX_BARS];
+    uint32_t     sriov_sup_pgsize;
 };
 
 /* Send a framed message (acquires send_mutex). */
