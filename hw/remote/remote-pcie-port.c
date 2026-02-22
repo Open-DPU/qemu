@@ -1253,7 +1253,7 @@ static void rpcie_rebuild_ari_chain(RemotePciePort *rp)
         active[count++] = devfn;
     }
 
-    if (count == 0) return;
+    if (count <= 1) return;  /* ARI only needed for multi-function */
 
     /* Link each active device to the next via ARI Extended Capability */
     for (int i = 0; i < count; i++) {
@@ -1263,10 +1263,49 @@ static void rpcie_rebuild_ari_chain(RemotePciePort *rp)
         /* Add ARI cap if not already present */
         uint16_t ari_off = pcie_find_capability(dev, PCI_EXT_CAP_ID_ARI);
         if (!ari_off) {
-            /* Place after SR-IOV on PFs, at 0x100 on VFs */
-            uint16_t offset = dev->exp.sriov_cap
-                ? (dev->exp.sriov_cap + PCI_EXT_CAP_SRIOV_SIZEOF)
-                : PCI_CONFIG_SPACE_SIZE;
+            /* Find free offset: walk the existing ext-cap chain to find
+             * the end, so we never overwrite RTL-defined capabilities
+             * (AER, power management, etc.) at 0x100+. */
+            uint16_t offset = PCI_CONFIG_SPACE_SIZE; /* 0x100 — fallback */
+            uint16_t pos = PCI_CONFIG_SPACE_SIZE;
+            while (pos >= PCI_CONFIG_SPACE_SIZE &&
+                   pos < PCIE_CONFIG_SPACE_SIZE - PCI_ARI_SIZEOF) {
+                uint32_t header = pci_get_long(dev->config + pos);
+                if (header == 0) {
+                    /* Empty slot — place ARI here */
+                    offset = pos;
+                    break;
+                }
+                /* This slot is occupied.  Compute its size so we can
+                 * skip past it.  QEMU tracks cap sizes internally via
+                 * pcie_add_capability, but the easiest portable approach
+                 * is to advance to the next-pointer from the header. */
+                uint16_t next = PCI_EXT_CAP_NEXT(header);
+                if (next == 0) {
+                    /* Last cap in chain — figure out size by looking at
+                     * what QEMU registered.  Use sriov_cap size if this
+                     * is the SR-IOV cap, otherwise default to 8 (the
+                     * minimum QEMU ext cap size). */
+                    uint16_t cap_id = PCI_EXT_CAP_ID(header);
+                    uint16_t cap_size = 8; /* QEMU minimum */
+                    if (cap_id == PCI_EXT_CAP_ID_SRIOV)
+                        cap_size = PCI_EXT_CAP_SRIOV_SIZEOF;
+                    else if (cap_id == PCI_EXT_CAP_ID_ERR)
+                        cap_size = PCI_ERR_SIZEOF; /* 0x48 */
+                    else if (cap_id == PCI_EXT_CAP_ID_ARI)
+                        cap_size = PCI_ARI_SIZEOF;
+                    offset = (pos + cap_size + 3) & ~3; /* 4-byte align */
+                    break;
+                }
+                pos = next;
+            }
+
+            if (offset + PCI_ARI_SIZEOF > PCIE_CONFIG_SPACE_SIZE) {
+                info_report("rpcie: no room for ARI cap on devfn %d",
+                            active[i]);
+                continue;
+            }
+
             pcie_add_capability(dev, PCI_EXT_CAP_ID_ARI, PCI_ARI_VER,
                                 offset, PCI_ARI_SIZEOF);
             ari_off = offset;
