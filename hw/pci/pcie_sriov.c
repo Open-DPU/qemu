@@ -463,7 +463,17 @@ void pcie_sriov_pf_reset(PCIDevice *dev)
      */
     pci_set_word(dev->config + sriov_cap + PCI_SRIOV_SYS_PGSIZE, 0x1);
 
+    /*
+     * Restore VF BAR types.  Skip PCI_ROM_SLOT (region 6) — VFs never
+     * have ROM BARs (see assert in pcie_sriov_pf_init_vf_bar), and
+     * pci_set_quad writes 8 bytes which would overflow past the SR-IOV
+     * cap boundary and clobber any extended capability placed immediately
+     * after (e.g. an ARI cap at sriov_cap + 0x40).
+     */
     for (uint16_t i = 0; i < PCI_NUM_REGIONS; i++) {
+        if (i == PCI_ROM_SLOT) {
+            continue;
+        }
         pci_set_quad(dev->config + sriov_cap + PCI_SRIOV_BAR + i * 4,
                      dev->exp.sriov_pf.vf_bar_type[i]);
     }

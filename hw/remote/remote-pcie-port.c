@@ -953,6 +953,7 @@ static int rpcie_apply_fn_add(PCIDevice *d, RemotePciePort *rp,
         /* Parse VF BAR descriptors into temporaries */
         uint64_t vf_bsz[RPCIE_MAX_BARS] = {0};
         uint8_t  vf_bty[RPCIE_MAX_BARS] = {0};
+        uint8_t  vf_bpf[RPCIE_MAX_BARS] = {0};
         for (int i = 0; i < sriov.num_vf_bars && i < RPCIE_MAX_BARS
              && remaining >= sizeof(rpcie_bar_desc_t); i++) {
             rpcie_bar_desc_t vf_bar;
@@ -961,6 +962,7 @@ static int rpcie_apply_fn_add(PCIDevice *d, RemotePciePort *rp,
             remaining -= sizeof(rpcie_bar_desc_t);
             vf_bsz[i] = vf_bar.size;
             vf_bty[i] = vf_bar.type;
+            vf_bpf[i] = vf_bar.prefetchable;
         }
 
         /* Store into the correct PF struct */
@@ -974,6 +976,7 @@ static int rpcie_apply_fn_add(PCIDevice *d, RemotePciePort *rp,
             rp->sriov_sup_pgsize   = sriov.supported_page_sizes;
             memcpy(rp->sriov_vf_bar_size, vf_bsz, sizeof(vf_bsz));
             memcpy(rp->sriov_vf_bar_type, vf_bty, sizeof(vf_bty));
+            memcpy(rp->sriov_vf_bar_prefetch, vf_bpf, sizeof(vf_bpf));
         } else {
             RemotePciePortPF *pf = REMOTE_PCIE_PORT_PF(d);
             pf->sriov_capable      = true;
@@ -985,6 +988,7 @@ static int rpcie_apply_fn_add(PCIDevice *d, RemotePciePort *rp,
             pf->sriov_sup_pgsize   = sriov.supported_page_sizes;
             memcpy(pf->sriov_vf_bar_size, vf_bsz, sizeof(vf_bsz));
             memcpy(pf->sriov_vf_bar_type, vf_bty, sizeof(vf_bty));
+            memcpy(pf->sriov_vf_bar_prefetch, vf_bpf, sizeof(vf_bpf));
         }
 
         info_report("rpcie: SR-IOV data saved for BDF 0x%04x "
@@ -1198,6 +1202,7 @@ static bool rpcie_init_sriov_on_pf(PCIDevice *d,
                                    uint8_t  num_vf_bars,
                                    const uint64_t *vf_bar_size,
                                    const uint8_t  *vf_bar_type,
+                                   const uint8_t  *vf_bar_prefetch,
                                    uint32_t sup_pgsize)
 {
     uint16_t sriov_off = rpcie_find_free_ext_cap_offset(
@@ -1222,6 +1227,8 @@ static bool rpcie_init_sriov_on_pf(PCIDevice *d,
         int pci_type = PCI_BASE_ADDRESS_SPACE_MEMORY;
         if (vf_bar_type[i] == RPCIE_BAR_MEM64)
             pci_type |= PCI_BASE_ADDRESS_MEM_TYPE_64;
+        if (vf_bar_prefetch && vf_bar_prefetch[i])
+            pci_type |= PCI_BASE_ADDRESS_MEM_PREFETCH;
         pcie_sriov_pf_init_vf_bar(d, i, pci_type, vf_bar_size[i]);
     }
 
@@ -1290,6 +1297,7 @@ offset_fixed:
                                 rp->sriov_num_vf_bars,
                                 rp->sriov_vf_bar_size,
                                 rp->sriov_vf_bar_type,
+                                rp->sriov_vf_bar_prefetch,
                                 rp->sriov_sup_pgsize)) {
         info_report("rpcie: SR-IOV init failed for PF0 (non-fatal)");
         rp->sriov_capable = false;
@@ -1849,6 +1857,7 @@ static void rpcie_pf_realize(PCIDevice *d, Error **errp)
                                     pf->sriov_num_vf_bars,
                                     pf->sriov_vf_bar_size,
                                     pf->sriov_vf_bar_type,
+                                    pf->sriov_vf_bar_prefetch,
                                     pf->sriov_sup_pgsize)) {
             info_report("rpcie: SR-IOV init failed for PF%d (non-fatal)",
                         pf->pf_index);
@@ -2001,6 +2010,7 @@ static void rpcie_vf_realize(PCIDevice *d, Error **errp)
     uint8_t  num_vf_bars;
     uint64_t *vf_bar_size;
     uint8_t  *vf_bar_type;
+    uint8_t  *vf_bar_prefetch;
     uint16_t pf_remote_bdf;
     uint16_t pf_vf_offset;
     uint16_t pf_vf_stride;
@@ -2013,6 +2023,7 @@ static void rpcie_vf_realize(PCIDevice *d, Error **errp)
         num_vf_bars    = rp0->sriov_num_vf_bars;
         vf_bar_size    = rp0->sriov_vf_bar_size;
         vf_bar_type    = rp0->sriov_vf_bar_type;
+        vf_bar_prefetch = rp0->sriov_vf_bar_prefetch;
         pf_remote_bdf  = rp0->remote_bdf;
         pf_vf_offset   = rp0->sriov_vf_offset;
         pf_vf_stride   = rp0->sriov_vf_stride;
@@ -2023,6 +2034,7 @@ static void rpcie_vf_realize(PCIDevice *d, Error **errp)
         num_vf_bars    = pf->sriov_num_vf_bars;
         vf_bar_size    = pf->sriov_vf_bar_size;
         vf_bar_type    = pf->sriov_vf_bar_type;
+        vf_bar_prefetch = pf->sriov_vf_bar_prefetch;
         pf_remote_bdf  = pf->remote_bdf;
         pf_vf_offset   = pf->sriov_vf_offset;
         pf_vf_stride   = pf->sriov_vf_stride;
@@ -2051,6 +2063,9 @@ static void rpcie_vf_realize(PCIDevice *d, Error **errp)
         int pci_type = PCI_BASE_ADDRESS_SPACE_MEMORY;
         if (vf_bar_type[i] == RPCIE_BAR_MEM64) {
             pci_type |= PCI_BASE_ADDRESS_MEM_TYPE_64;
+        }
+        if (vf_bar_prefetch && vf_bar_prefetch[i]) {
+            pci_type |= PCI_BASE_ADDRESS_MEM_PREFETCH;
         }
         pci_register_bar(d, i, pci_type, &vf->bar_mr[i]);
 

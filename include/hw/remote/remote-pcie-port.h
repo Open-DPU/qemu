@@ -88,6 +88,7 @@ struct RemotePciePort {
     uint8_t      sriov_num_vf_bars;
     uint64_t     sriov_vf_bar_size[RPCIE_MAX_BARS];
     uint8_t      sriov_vf_bar_type[RPCIE_MAX_BARS];
+    uint8_t      sriov_vf_bar_prefetch[RPCIE_MAX_BARS];
     uint32_t     sriov_sup_pgsize;
 
     /* Multi-PF: companion PCI devices for functions 1-7 */
@@ -134,6 +135,7 @@ struct RemotePciePortPF {
     uint8_t      sriov_num_vf_bars;
     uint64_t     sriov_vf_bar_size[RPCIE_MAX_BARS];
     uint8_t      sriov_vf_bar_type[RPCIE_MAX_BARS];
+    uint8_t      sriov_vf_bar_prefetch[RPCIE_MAX_BARS];
     uint32_t     sriov_sup_pgsize;
 };
 
