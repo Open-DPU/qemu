@@ -1178,6 +1178,12 @@ static uint16_t rpcie_find_free_ext_cap_offset(PCIDevice *dev, uint16_t needed)
             case PCI_EXT_CAP_ID_ERR:   cap_size = PCI_ERR_SIZEOF;          break;
             case PCI_EXT_CAP_ID_SRIOV: cap_size = PCI_EXT_CAP_SRIOV_SIZEOF; break;
             case PCI_EXT_CAP_ID_ARI:   cap_size = PCI_ARI_SIZEOF;          break;
+            case PCI_EXT_CAP_ID_VNDR: /* Vendor-Specific (VSEC) */ {
+                uint32_t vsec_hdr = pci_get_long(dev->config + pos + 4);
+                cap_size = (vsec_hdr >> 20) & 0xFFF;
+                if (cap_size < 8) cap_size = 8;
+                break;
+            }
             default:                   cap_size = 8; /* QEMU minimum */    break;
             }
             uint16_t candidate = (pos + cap_size + 3) & ~3; /* 4-byte align */
