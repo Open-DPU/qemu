@@ -185,6 +185,7 @@ static void remote_usb_class_init(ObjectClass *klass, const void *data) {
     uc->unrealize      = remote_usb_unrealize;
     uc->handle_control = remote_usb_handle_control;
     uc->handle_data    = remote_usb_handle_data;
+    uc->product_desc   = "Remote USB Port (chisel-usb cosim bridge)";
 
     dc->desc          = "Remote USB Port (chisel-usb cosim bridge)";
     device_class_set_props(dc, remote_usb_properties);
