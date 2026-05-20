@@ -71,6 +71,9 @@ if canokey.found()
   system_ss.add(when: 'CONFIG_USB_CANOKEY', if_true: [canokey, files('canokey.c')])
 endif
 
+# remote usb port (chisel-usb cosim bridge)
+system_ss.add(when: 'CONFIG_USB_REMOTE', if_true: files('remote-usb-port.c'))
+
 # usb redirect
 if usbredir.found()
   usbredir_ss = ss.source_set()
