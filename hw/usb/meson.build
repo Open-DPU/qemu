@@ -72,7 +72,7 @@ if canokey.found()
 endif
 
 # remote usb port (chisel-usb cosim bridge)
-system_ss.add(when: 'CONFIG_USB_REMOTE', if_true: files('remote-usb-port.c'))
+system_ss.add(when: 'CONFIG_USB_REMOTE', if_true: files('remote-usb-port.c', 'remote-usb-hub.c'))
 
 # usb redirect
 if usbredir.found()
