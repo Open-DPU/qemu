@@ -1,25 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
-// rusb_protocol.h — Remote USB Port wire protocol
+// rusb_protocol.h - Remote USB Port wire protocol (v2, transaction-level)
 //
-// Shared between QEMU's remote-usb-port device and any endpoint
-// simulation server (Verilator, VCS, FPGA proxy, etc.).
+// Shared between QEMU's remote-usb-port device and a chisel-usb
+// simulation server (Verilator + ChiselSim).
 //
-// The protocol models a single USB device link at the packet level.
-// The QEMU side acts as a host controller (HC); the remote side acts
-// as a USB device (which may expose multiple interfaces / endpoints).
+// Semantics:
+//   QEMU's USB core dispatches per-transaction callbacks:
+//     - handle_control(): one whole control transfer (setup + data + status)
+//     - handle_data(USB_TOKEN_OUT/IN): one bulk/intr packet
+//   Each callback is wrapped into a single transaction message and
+//   exchanged with the sim. The sim's UsbHostBfm executes the
+//   wire-level USB packets (token + data + handshake with CRCs) and
+//   returns a TXN_RESULT.
 //
-// Two physical layers are supported:
-//  - UTMI+/ULPI byte stream  (USB 2.0 LS/FS/HS)
-//  - PIPE 32-bit symbols      (USB 3.x SS/SS+)
+// Connection:
+//   QEMU connects(SOCK_STREAM, AF_UNIX) to a listening socket created
+//   by the simulator. On connect, QEMU sends HELLO; the simulator
+//   processes incoming messages serially.
 //
-// At the protocol level both reduce to "framed bytes between host and
-// device" plus a small number of side-band signals (reset, suspend,
-// resume, attach, detach). The simulation server tells QEMU which
-// physical layer it expects via the ATTACH message.
-//
-// All multi-byte fields are little-endian on the wire.
-//
-// Copyright 2026 Open-DPU Project
+// All multi-byte fields are little-endian.
 
 #ifndef RUSB_PROTOCOL_H
 #define RUSB_PROTOCOL_H
@@ -31,104 +30,94 @@ extern "C" {
 #endif
 
 #define RUSB_MAGIC            0x52555342u   // "RUSB"
-#define RUSB_PROTOCOL_VERSION 1
+#define RUSB_PROTOCOL_VERSION 2
+#define RUSB_MAX_PACKET       8192
 
-/** Maximum USB packet size accepted in a single frame. USB 2.0 caps at
- *  1024 (iso/intr HS) + PID + CRC; USB 3.x bursts can carry larger
- *  data-packet payloads (1024 bytes × burst). We pick 8192 as a
- *  generous upper bound. */
-#define RUSB_MAX_PACKET 8192
-
-/* ====================================================================
- *  Frame header — every message on the Unix socket
- * ==================================================================== */
-//
-//  ┌──────────────┬──────────────┬───────────┬──────────────────────┐
-//  │ magic (4B)   │ length (4B)  │ seq (4B)  │ payload[length]      │
-//  └──────────────┴──────────────┴───────────┴──────────────────────┘
-//
-//  `length` — byte count of payload (excludes the 12-byte frame header).
-//  `seq`    — sequence number for request/completion matching.
-//             Downstream messages (QEMU → sim) use odd seq numbers.
-//             Upstream messages (sim → QEMU) use even seq numbers.
-//
+// ------- frame header (always 12 bytes) -------
 typedef struct __attribute__((packed)) {
     uint32_t magic;
-    uint32_t length;
+    uint32_t length;    // payload bytes following this header
     uint32_t seq;
 } rusb_frame_hdr_t;
 
-/* ====================================================================
- *  Message types
- * ==================================================================== */
+// ------- message types -------
+#define RUSB_MSG_HELLO          0x00   // QEMU -> sim on connect
+#define RUSB_MSG_BUS_RESET      0x03   // QEMU -> sim
+#define RUSB_MSG_CONTROL_TXN    0x40   // QEMU -> sim: full control transfer
+#define RUSB_MSG_OUT_TXN        0x41   // QEMU -> sim: bulk/intr OUT packet
+#define RUSB_MSG_IN_TXN         0x42   // QEMU -> sim: bulk/intr IN poll
+#define RUSB_MSG_TXN_RESULT     0x50   // sim -> QEMU: result of any *_TXN
 
-#define RUSB_MSG_HELLO         0x00   /* version handshake (bidir)       */
-#define RUSB_MSG_ATTACH        0x01   /* sim declares phy + speed        */
-#define RUSB_MSG_DETACH        0x02   /* device disconnected             */
-#define RUSB_MSG_BUS_RESET     0x03   /* host issues bus reset           */
-#define RUSB_MSG_SUSPEND       0x04   /* host suspended bus              */
-#define RUSB_MSG_RESUME        0x05   /* host resumed bus                */
-#define RUSB_MSG_REMOTE_WAKEUP 0x06   /* device-initiated wakeup         */
-#define RUSB_MSG_PACKET_OUT    0x10   /* host → device packet bytes      */
-#define RUSB_MSG_PACKET_IN     0x11   /* device → host packet bytes      */
-#define RUSB_MSG_LINE_STATE    0x20   /* UTMI lineState[1:0]             */
-#define RUSB_MSG_LTSSM_STATE   0x21   /* USB 3.x LTSSM state             */
-#define RUSB_MSG_ERROR         0xFF   /* protocol or simulation error    */
+// TXN_RESULT.status values
+#define RUSB_STATUS_OK          0   // ACK / success
+#define RUSB_STATUS_NAK         1   // device NAK
+#define RUSB_STATUS_STALL       2   // device STALL
+#define RUSB_STATUS_TIMEOUT     3   // no response
 
-/* ====================================================================
- *  Physical-layer enum (carried in ATTACH)
- * ==================================================================== */
-
-#define RUSB_PHY_UTMI   0x00
-#define RUSB_PHY_ULPI   0x01
-#define RUSB_PHY_PIPE   0x02
-
-/* ====================================================================
- *  Speed enum (carried in ATTACH / SUSPEND / RESUME)
- * ==================================================================== */
-
-#define RUSB_SPEED_LOW       0x00
-#define RUSB_SPEED_FULL      0x01
-#define RUSB_SPEED_HIGH      0x02
-#define RUSB_SPEED_SUPER     0x03
-#define RUSB_SPEED_SUPER_PLUS 0x04
-
-/* ====================================================================
- *  Payload structs
- * ==================================================================== */
-
+// ------- HELLO -------
 typedef struct __attribute__((packed)) {
-    uint8_t  msg_type;     /* RUSB_MSG_HELLO */
-    uint8_t  version;
-    uint8_t  reserved[2];
+    uint8_t msg_type;       // 0x00
+    uint8_t version;
+    uint8_t reserved[2];
 } rusb_hello_t;
 
+// ------- BUS_RESET -------
 typedef struct __attribute__((packed)) {
-    uint8_t  msg_type;     /* RUSB_MSG_ATTACH */
-    uint8_t  phy;          /* RUSB_PHY_* */
-    uint8_t  speed;        /* RUSB_SPEED_* */
-    uint8_t  reserved;
-} rusb_attach_t;
+    uint8_t msg_type;       // 0x03
+    uint8_t reserved[3];
+} rusb_bus_reset_t;
 
+// ------- CONTROL_TXN (16-byte fixed header + optional OUT data) -------
+//
+//  When direction == 0 (OUT):  payload bytes after the fixed header
+//                              contain the host-to-device data stage
+//                              (length = data_len).
+//  When direction == 1 (IN):   data_len is the host's expected
+//                              wLength; sim collects up to that many
+//                              bytes into the TXN_RESULT.
+//
 typedef struct __attribute__((packed)) {
-    uint8_t  msg_type;     /* RUSB_MSG_PACKET_OUT or RUSB_MSG_PACKET_IN */
-    uint8_t  reserved[3];
-    uint32_t length;       /* number of packet bytes that follow */
-    /* uint8_t bytes[length] */
-} rusb_packet_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t  msg_type;     /* RUSB_MSG_LINE_STATE */
-    uint8_t  line_state;   /* 0=SE0, 1=J, 2=K, 3=SE1 */
-    uint8_t  reserved[2];
-} rusb_line_state_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t  msg_type;     /* RUSB_MSG_ERROR */
-    uint8_t  code;         /* implementation-defined */
+    uint8_t  msg_type;       // 0x40
+    uint8_t  addr;           // device USB address (0 before SET_ADDRESS)
+    uint8_t  max_packet_size;// ep0 wMaxPacketSize (8/16/32/64)
+    uint8_t  direction;      // 0 = OUT, 1 = IN
+    uint8_t  setup[8];       // raw 8-byte setup packet
+    uint16_t data_len;       // OUT: bytes following; IN: expected wLength
     uint16_t reserved;
-    /* uint8_t message[]   — UTF-8 description (not NUL-terminated) */
-} rusb_error_t;
+    // uint8_t data[data_len]  -- only when direction == 0
+} rusb_control_txn_t;
+
+// ------- OUT_TXN (8-byte fixed header + data) -------
+typedef struct __attribute__((packed)) {
+    uint8_t  msg_type;       // 0x41
+    uint8_t  addr;
+    uint8_t  ep;
+    uint8_t  data_pid;       // 0 = DATA0, 1 = DATA1
+    uint16_t length;
+    uint16_t reserved;
+    // uint8_t data[length]
+} rusb_out_txn_t;
+
+// ------- IN_TXN (8-byte fixed header) -------
+typedef struct __attribute__((packed)) {
+    uint8_t  msg_type;       // 0x42
+    uint8_t  addr;
+    uint8_t  ep;
+    uint8_t  reserved;
+    uint16_t max_length;
+    uint16_t reserved2;
+} rusb_in_txn_t;
+
+// ------- TXN_RESULT (8-byte fixed header + optional IN data) -------
+typedef struct __attribute__((packed)) {
+    uint8_t  msg_type;       // 0x50
+    uint8_t  status;         // RUSB_STATUS_*
+    uint8_t  data_pid;       // 0/1 for IN replies, 0 otherwise
+    uint8_t  reserved;
+    uint16_t length;         // number of payload data bytes following
+    uint16_t reserved2;
+    // uint8_t data[length]
+} rusb_txn_result_t;
 
 #ifdef __cplusplus
 }
